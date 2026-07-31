@@ -3,3 +3,4 @@ docker_test_data/
 agentcost_data/
 __pycache__/
 *.pyc
+*.bak
