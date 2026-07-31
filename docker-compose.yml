@@ -1,0 +1,22 @@
+services:
+  agentcost:
+    build: .
+    container_name: agentcost
+    restart: unless-stopped
+    ports:
+      - "8666:8666"
+    environment:
+      # 日志路径（宿主机路径，容器内只读挂载）
+      - AGENTCOST_CODEX_DIR=/logs/codex
+      - AGENTCOST_CLAUDE_DIR=/logs/claude
+      - AGENTCOST_HERMES_DB=/logs/hermes/state.db
+      - AGENTCOST_DATA_DIR=/data
+      - AGENTCOST_PORT=8666
+      - AGENTCOST_REFRESH_SECONDS=300
+    volumes:
+      # 数据持久化（DB + 配置）
+      - ./agentcost_data:/data
+      # 宿主机 AI agent 日志（只读）
+      - ~/.codex:/logs/codex:ro
+      - ~/.claude:/logs/claude:ro
+      - ~/.hermes:/logs/hermes:ro
