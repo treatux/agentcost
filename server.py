@@ -32,6 +32,7 @@ PARSER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parser.p
 # 将可变配置与数据库放在同一个数据目录，容器挂载 /data 后可持久化。
 OVERRIDE_PATH = os.path.join(DB_DIR, "models_override.json")
 CONFIG_PATH = os.path.join(DB_DIR, "config.json")
+USERS_PATH = os.path.join(DB_DIR, "users.json")
 PORT = int(os.environ.get("AGENTCOST_PORT", "8666"))
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 AUTO_REFRESH_SECONDS = int(os.environ.get("AGENTCOST_REFRESH_SECONDS", "300"))  # 默认每 5 分钟自动刷新
@@ -71,6 +72,8 @@ DEFAULT_CONFIG = {
     "ingest_key": "",             # 独立数据接入密钥；为空时仅允许登录 token
     "share_enabled": False,
     "share_token": "",
+    "share_user": "",
+    "share_role": "",
 }
 _config = dict(DEFAULT_CONFIG)
 _last_notify = {}  # level -> timestamp
@@ -123,15 +126,20 @@ def save_models_override(ovr):
     return ovr
 
 
-def model_catalog():
+def model_catalog(user=None):
     """返回所有已知模型 + 当前上游/价格 + 是否被用户覆盖。"""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    rows = cur.execute("""
+    where = ""
+    params = ()
+    if user:
+        where = " WHERE user = ?"
+        params = (user,)
+    rows = cur.execute(f"""
         SELECT model, upstream, price_in, price_out, billing_mode,
                COUNT(*) as cnt, SUM(total_tokens) as tokens, SUM(cost_usd) as cost
-        FROM usage_records GROUP BY model, upstream ORDER BY tokens DESC
-    """).fetchall()
+        FROM usage_records{where} GROUP BY model, upstream ORDER BY tokens DESC
+    """, params).fetchall()
     conn.close()
     ovr = load_models_override()
     models = []
@@ -442,21 +450,49 @@ def fetch_fx_rate():
             continue
     return FX_RATE
 
-# ---- 认证配置 ----
-# 用户名: 密码（明文仅用于个人部署；生产请换 hash）
-AUTH_USERS = {"agentcost": "Ac@2026!dash"}
-# 内存 token 表: token -> username
+# ---- 用户与认证 ----
+def password_hash(password):
+    return hashlib.sha256(str(password).encode("utf-8")).hexdigest()
+
+
+def load_users():
+    """加载用户表；首次启动创建默认管理员。"""
+    try:
+        with open(USERS_PATH, encoding="utf-8") as f:
+            users = json.load(f)
+        if not isinstance(users, dict):
+            raise ValueError("用户文件格式错误")
+        return users
+    except FileNotFoundError:
+        users = {"agentcost": {"password_hash": password_hash("Ac@2026!dash"), "role": "admin"}}
+        save_users(users)
+        return users
+    except Exception:
+        return {}
+
+
+def save_users(users):
+    with open(USERS_PATH, "w", encoding="utf-8") as f:
+        json.dump(users, f, ensure_ascii=False, indent=2)
+
+
+# 内存 token 表: token -> {user, role, exp}
 TOKENS = {}
 TOKEN_TTL = timedelta(hours=12)
 
 
-def make_token(username):
+def make_token(username, role="user"):
     token = secrets.token_urlsafe(32)
-    TOKENS[token] = {"user": username, "exp": datetime.now() + TOKEN_TTL}
+    TOKENS[token] = {"user": username, "role": role, "exp": datetime.now() + TOKEN_TTL}
     return token
 
 
 def check_token(token):
+    info = get_token_info(token)
+    return info["user"] if info else None
+
+
+def get_token_info(token):
     if not token:
         return None
     info = TOKENS.get(token)
@@ -465,15 +501,17 @@ def check_token(token):
     if datetime.now() > info["exp"]:
         TOKENS.pop(token, None)
         return None
-    return info["user"]
+    return {"user": info["user"], "role": info.get("role", "user")}
 
 
-def check_share_token(token):
-    """校验只读分享令牌。"""
+def get_share_info(token):
+    """校验只读分享令牌，并返回创建者身份。"""
     configured = str(_config.get("share_token") or "")
     if not configured or not _config.get("share_enabled") or not token:
-        return False
-    return hmac.compare_digest(configured, str(token))
+        return None
+    if not hmac.compare_digest(configured, str(token)):
+        return None
+    return {"user": _config.get("share_user", ""), "role": _config.get("share_role") or "admin"}
 
 
 def query_db(sql, params=()):
@@ -485,6 +523,22 @@ def query_db(sql, params=()):
     return [dict(r) for r in rows]
 
 
+def ensure_usage_schema():
+    """为已有数据库补齐多用户列，不重建历史数据。"""
+    if not os.path.exists(DB_PATH):
+        return
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(usage_records)").fetchall()}
+        if cols and "user" not in cols:
+            conn.execute("ALTER TABLE usage_records ADD COLUMN user TEXT")
+            conn.commit()
+    except sqlite3.Error:
+        pass
+    finally:
+        conn.close()
+
+
 def parse_range(params):
     """解析 from/to 参数，返回 (from_str, to_str)。默认近 7 天。"""
     today = datetime.now().strftime("%Y-%m-%d")
@@ -493,7 +547,7 @@ def parse_range(params):
     return frm, to
 
 
-def summary(frm, to, agent=None, upstream=None, model=None, group_by="day"):
+def summary(frm, to, agent=None, upstream=None, model=None, group_by="day", user=None):
     """范围汇总。"""
     if group_by not in ("day", "hour"):
         group_by = "day"
@@ -524,6 +578,9 @@ def summary(frm, to, agent=None, upstream=None, model=None, group_by="day"):
     if model:
         filter_cond.append("model = ?")
         filter_params.append(model)
+    if user:
+        filter_cond.append("user = ?")
+        filter_params.append(user)
 
     def filtered(cond, params):
         parts = [cond, *filter_cond]
@@ -668,7 +725,7 @@ def summary(frm, to, agent=None, upstream=None, model=None, group_by="day"):
 
     return {
         "last_scan": LAST_SCAN_AT,
-        "min_ts": ((query_db("SELECT MIN(ts) AS min_ts FROM usage_records")[0].get("min_ts") or "")[:10] or None),
+        "min_ts": ((query_db("SELECT MIN(ts) AS min_ts FROM usage_records" + (" WHERE user = ?" if user else ""), (user,) if user else ())[0].get("min_ts") or "")[:10] or None),
         "range": {"from": frm, "to": to},
         "fx": fx,
         "total": with_cny(total, ("cost", "saved_usd")),
@@ -720,13 +777,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def check_ingest_auth(self):
         """接入 API 支持登录 token，或配置的独立 X-Ingest-Key。"""
-        if check_token(self.headers.get("X-Token", "")):
-            return True
+        info = get_token_info(self.headers.get("X-Token", ""))
+        if info:
+            return "token", info
         ingest_key = str(_config.get("ingest_key") or "")
         supplied = self.headers.get("X-Ingest-Key", "")
-        return bool(ingest_key and supplied and hmac.compare_digest(ingest_key, supplied))
+        if ingest_key and supplied and hmac.compare_digest(ingest_key, supplied):
+            return "ingest_key", None
+        return None, None
 
-    def ingest(self, data):
+    def ingest(self, data, auth_kind, token_info):
         """校验并批量写入 API 用量记录。"""
         items = data if isinstance(data, list) else [data]
         if not items or any(not isinstance(item, dict) for item in items):
@@ -771,13 +831,23 @@ class Handler(BaseHTTPRequestHandler):
             if request_id is not None and not isinstance(request_id, str):
                 self.send_json({"ok": False, "error": "request_id 必须是字符串"}, status=400)
                 return
+            requested_user = item.get("user")
+            if requested_user is not None and (not isinstance(requested_user, str) or not requested_user.strip()):
+                self.send_json({"ok": False, "error": "user 必须是非空字符串"}, status=400)
+                return
+            record_user = requested_user.strip() if isinstance(requested_user, str) else None
+            if auth_kind == "ingest_key" and not record_user:
+                self.send_json({"ok": False, "error": "X-Ingest-Key 认证时 user 必填"}, status=400)
+                return
+            if auth_kind == "token" and not record_user:
+                record_user = token_info["user"]
             rows.append((
                 item.get("agent", ""), ts, model,
                 *(str(item.get(field, "") or "") for field in str_fields[2:]),
                 values["input_tokens"], values["output_tokens"],
                 values["cache_read_tokens"], values["cache_write_tokens"],
                 values["reasoning_tokens"], values["total_tokens"], values["cost_usd"], "api",
-                request_id,
+                request_id, record_user,
             ))
 
         conn = sqlite3.connect(DB_PATH)
@@ -788,6 +858,8 @@ class Handler(BaseHTTPRequestHandler):
                 cur.execute("ALTER TABLE usage_records ADD COLUMN source TEXT DEFAULT 'parser'")
             if "request_id" not in cols:
                 cur.execute("ALTER TABLE usage_records ADD COLUMN request_id TEXT")
+            if "user" not in cols:
+                cur.execute("ALTER TABLE usage_records ADD COLUMN user TEXT")
             insert_rows = []
             skipped = 0
             seen_request_ids = set()
@@ -807,8 +879,8 @@ class Handler(BaseHTTPRequestHandler):
                 INSERT INTO usage_records
                 (agent, ts, model, provider, upstream, base_url, billing_mode, price_in, price_out,
                  cwd, originator, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                 reasoning_tokens, total_tokens, cost_usd, source, request_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 reasoning_tokens, total_tokens, cost_usd, source, request_id, user)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, [row[:7] + (None, None) + row[7:] for row in insert_rows])
             conn.commit()
         finally:
@@ -820,17 +892,51 @@ class Handler(BaseHTTPRequestHandler):
             data = self.read_body()
             username = data.get("username", "")
             password = data.get("password", "")
-            stored = AUTH_USERS.get(username)
-            if stored and hmac.compare_digest(stored, password):
-                token = make_token(username)
-                self.send_json({"ok": True, "token": token, "user": username})
+            users = load_users()
+            entry = users.get(username) if isinstance(username, str) else None
+            stored = entry.get("password_hash", "") if isinstance(entry, dict) else ""
+            role = entry.get("role", "user") if isinstance(entry, dict) else "user"
+            if stored and hmac.compare_digest(stored, password_hash(password)):
+                token = make_token(username, role)
+                self.send_json({"ok": True, "token": token, "user": username, "role": role})
             else:
                 self.send_json({"ok": False, "error": "用户名或密码错误"}, status=401)
         elif self.path == "/api/ingest":
-            if not self.check_ingest_auth():
+            auth_kind, token_info = self.check_ingest_auth()
+            if not auth_kind:
                 self.send_json({"ok": False, "error": "未登录"}, status=401)
                 return
-            self.ingest(self.read_body())
+            self.ingest(self.read_body(), auth_kind, token_info)
+        elif self.path == "/api/users":
+            info = get_token_info(self.headers.get("X-Token", ""))
+            if not info:
+                self.send_json({"ok": False, "error": "未登录"}, status=401)
+                return
+            if info["role"] != "admin":
+                self.send_json({"ok": False, "error": "无权限"}, status=403)
+                return
+            data = self.read_body()
+            username = data.get("username")
+            password = data.get("password", "")
+            role = data.get("role", "user")
+            if not isinstance(username, str) or not username.strip() or role not in ("admin", "user"):
+                self.send_json({"ok": False, "error": "username 和 role（admin/user）必填"}, status=400)
+                return
+            if not isinstance(password, str):
+                self.send_json({"ok": False, "error": "password 必须是字符串"}, status=400)
+                return
+            username = username.strip()
+            users = load_users()
+            old = users.get(username, {})
+            entry = {"password_hash": old.get("password_hash", ""), "role": role}
+            if password:
+                entry["password_hash"] = password_hash(password)
+            if not entry["password_hash"]:
+                self.send_json({"ok": False, "error": "新用户必须提供 password"}, status=400)
+                return
+            users[username] = entry
+            save_users(users)
+            self.send_json({"ok": True, "user": {"username": username, "role": role}})
         elif self.path == "/api/config":
             token = self.headers.get("X-Token", "")
             if not check_token(token):
@@ -896,17 +1002,18 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
-    def send_export_csv(self, frm, to):
+    def send_export_csv(self, frm, to, user=None):
         """导出所选范围的用量明细为 CSV。"""
         to_next = (datetime.strptime(to, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
         conn = sqlite3.connect(DB_PATH)
-        rows = conn.execute("""
+        where = "ts >= ? AND ts < ?" + (" AND user = ?" if user else "")
+        rows = conn.execute(f"""
             SELECT ts, agent, model, upstream, billing_mode,
                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
                    total_tokens, cost_usd
-            FROM usage_records WHERE ts >= ? AND ts < ?
+            FROM usage_records WHERE {where}
             ORDER BY ts
-        """, (frm, to_next)).fetchall()
+        """, (frm, to_next, user) if user else (frm, to_next)).fetchall()
         conn.close()
 
         buf = io.StringIO()
@@ -933,8 +1040,17 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         params = parse_qs(urlparse(self.path).query)
-        share_ok = (check_share_token(params.get("token", [""])[0]) or
-                    check_share_token(self.headers.get("X-Share-Token", "")))
+        token = self.headers.get("X-Token", "")
+        token_info = get_token_info(token)
+        share_info = (get_share_info(params.get("token", [""])[0]) or
+                      get_share_info(self.headers.get("X-Share-Token", "")))
+
+        def scoped_user(info, requested=None):
+            """普通用户及其分享链接始终仅能查询自己的归属数据。"""
+            if info and info.get("role") != "admin":
+                return info["user"]
+            requested = (requested or "").strip()
+            return None if requested in ("", "all") else requested
 
         if path == "/api/health":
             records = 0
@@ -958,8 +1074,8 @@ class Handler(BaseHTTPRequestHandler):
                 "last_scan": LAST_SCAN_AT,
             })
         elif path == "/api/summary":
-            token = self.headers.get("X-Token", "")
-            if not check_token(token) and not share_ok:
+            identity = token_info or share_info
+            if not identity:
                 self.send_json({"ok": False, "error": "未登录"}, status=401)
                 return
             frm, to = parse_range(params)
@@ -967,23 +1083,36 @@ class Handler(BaseHTTPRequestHandler):
             upstream = params.get("upstream", [""])[0].strip()
             model = params.get("model", [""])[0].strip()
             group_by = params.get("group_by", ["day"])[0].strip().lower()
+            user = scoped_user(identity, params.get("user", [""])[0])
             self.send_json({"ok": True, **summary(
                 frm, to, agent=agent or None, upstream=upstream or None,
-                model=model or None, group_by=group_by,
+                model=model or None, group_by=group_by, user=user,
             )})
         elif path == "/api/filters":
-            token = self.headers.get("X-Token", "")
-            if not check_token(token) and not share_ok:
+            identity = token_info or share_info
+            if not identity:
                 self.send_json({"ok": False, "error": "未登录"}, status=401)
                 return
-            rows = query_db("""
+            user = scoped_user(identity, params.get("user", [""])[0])
+            where = "WHERE ((agent IS NOT NULL AND agent != '') OR (upstream IS NOT NULL AND upstream != ''))"
+            query_params = ()
+            if user:
+                where += " AND user = ?"
+                query_params = (user,)
+            rows = query_db(f"""
                 SELECT DISTINCT agent, upstream FROM usage_records
-                WHERE (agent IS NOT NULL AND agent != '')
-                   OR (upstream IS NOT NULL AND upstream != '')
-            """)
+                {where}
+            """, query_params)
             agents = sorted({row["agent"] for row in rows if row["agent"]})
             upstreams = sorted({row["upstream"] for row in rows if row["upstream"]})
-            self.send_json({"ok": True, "agents": agents, "upstreams": upstreams})
+            users = []
+            if identity.get("role") == "admin":
+                users = [r["user"] for r in query_db(
+                    "SELECT DISTINCT user FROM usage_records WHERE user IS NOT NULL AND user != '' ORDER BY user"
+                )]
+            elif identity.get("user"):
+                users = [identity["user"]]
+            self.send_json({"ok": True, "agents": agents, "upstreams": upstreams, "users": users})
         elif path == "/api/config":
             token = self.headers.get("X-Token", "")
             if not check_token(token):
@@ -996,32 +1125,42 @@ class Handler(BaseHTTPRequestHandler):
             cfg["fx"] = fetch_fx_rate()
             self.send_json({"ok": True, "config": cfg})
         elif path == "/api/models":
-            token = self.headers.get("X-Token", "")
-            if not check_token(token) and not share_ok:
+            identity = token_info or share_info
+            if not identity:
                 self.send_json({"ok": False, "error": "未登录"}, status=401)
                 return
-            self.send_json({"ok": True, **model_catalog()})
+            self.send_json({"ok": True, **model_catalog(scoped_user(identity, params.get("user", [""])[0]))})
         elif path == "/api/export":
-            token = self.headers.get("X-Token", "")
-            if not check_token(token):
+            if not token_info:
                 self.send_json({"ok": False, "error": "未登录"}, status=401)
                 return
             frm, to = parse_range(params)
-            self.send_export_csv(frm, to)
+            self.send_export_csv(frm, to, scoped_user(token_info, params.get("user", [""])[0]))
+        elif path == "/api/users":
+            if not token_info:
+                self.send_json({"ok": False, "error": "未登录"}, status=401)
+                return
+            if token_info["role"] != "admin":
+                self.send_json({"ok": False, "error": "无权限"}, status=403)
+                return
+            users = load_users()
+            self.send_json({"ok": True, "users": [
+                {"username": username, "role": entry.get("role", "user")}
+                for username, entry in sorted(users.items()) if isinstance(entry, dict)
+            ]})
         elif path == "/api/share/create":
-            token = self.headers.get("X-Token", "")
-            if not check_token(token):
+            if not token_info:
                 self.send_json({"ok": False, "error": "未登录"}, status=401)
                 return
             share_token = secrets.token_urlsafe(16)
-            save_config({"share_enabled": True, "share_token": share_token})
+            save_config({"share_enabled": True, "share_token": share_token,
+                         "share_user": token_info["user"], "share_role": token_info["role"]})
             self.send_json({"ok": True, "share_url": "/share/?token=" + share_token})
         elif path == "/api/share/revoke":
-            token = self.headers.get("X-Token", "")
-            if not check_token(token):
+            if not token_info:
                 self.send_json({"ok": False, "error": "未登录"}, status=401)
                 return
-            save_config({"share_enabled": False, "share_token": ""})
+            save_config({"share_enabled": False, "share_token": "", "share_user": "", "share_role": ""})
             self.send_json({"ok": True})
         elif path == "/share/" or path == "/share":
             # 重定向到根路径（保留 ?token= 参数），保证页面内相对路径 api/... 正确解析
@@ -1036,6 +1175,36 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def do_DELETE(self):
+        path = urlparse(self.path).path
+        params = parse_qs(urlparse(self.path).query)
+        if path != "/api/users":
+            self.send_error(404)
+            return
+        info = get_token_info(self.headers.get("X-Token", ""))
+        if not info:
+            self.send_json({"ok": False, "error": "未登录"}, status=401)
+            return
+        if info["role"] != "admin":
+            self.send_json({"ok": False, "error": "无权限"}, status=403)
+            return
+        username = params.get("username", [""])[0].strip()
+        users = load_users()
+        if not username or username not in users:
+            self.send_json({"ok": False, "error": "用户不存在"}, status=404)
+            return
+        if username == info["user"]:
+            self.send_json({"ok": False, "error": "不允许删除自己"}, status=400)
+            return
+        if users[username].get("role") == "admin":
+            admins = sum(1 for entry in users.values() if isinstance(entry, dict) and entry.get("role") == "admin")
+            if admins <= 1:
+                self.send_json({"ok": False, "error": "不允许删除最后一个管理员"}, status=400)
+                return
+        del users[username]
+        save_users(users)
+        self.send_json({"ok": True})
+
 
 def main():
     print(f"AgentCost v3 仪表盘: http://localhost:{PORT}")
@@ -1044,6 +1213,8 @@ def main():
     os.makedirs(DB_DIR, exist_ok=True)
     # 在接受请求前加载配置，确保独立接入 Key 立即生效。
     load_config()
+    load_users()
+    ensure_usage_schema()
     # 启动自动刷新线程（守护线程，随主进程退出）
     threading.Thread(target=auto_refresh_loop, daemon=True).start()
     server = HTTPServer(("0.0.0.0", PORT), Handler)

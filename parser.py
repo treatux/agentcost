@@ -17,6 +17,7 @@ CODEX_DIR = os.environ.get("AGENTCOST_CODEX_DIR", os.path.expanduser("~/.codex")
 CLAUDE_DIR = os.environ.get("AGENTCOST_CLAUDE_DIR", os.path.expanduser("~/.claude"))
 HERMES_DB = os.environ.get("AGENTCOST_HERMES_DB", os.path.expanduser("~/.hermes/state.db"))
 DB_DIR = os.environ.get("AGENTCOST_DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_USER = os.environ.get("AGENTCOST_DEFAULT_USER") or None
 
 # ---------- 模型定价表（美元/百万token，输入/输出） ----------
 # 官方基础价（rate_multiplier 的基准）
@@ -404,7 +405,8 @@ def build_db(records, db_path):
             total_tokens INTEGER,
             cost_usd REAL,
             source TEXT DEFAULT 'parser',
-            request_id TEXT
+            request_id TEXT,
+            user TEXT
         )
     """)
     # 兼容旧库：为已有表补充来源列；归一化历史上游名称并仅清理保留窗口外的解析器数据。
@@ -413,6 +415,8 @@ def build_db(records, db_path):
         cur.execute("ALTER TABLE usage_records ADD COLUMN source TEXT DEFAULT 'parser'")
     if "request_id" not in cols:
         cur.execute("ALTER TABLE usage_records ADD COLUMN request_id TEXT")
+    if "user" not in cols:
+        cur.execute("ALTER TABLE usage_records ADD COLUMN user TEXT")
     cur.execute("UPDATE usage_records SET upstream = lower(upstream) WHERE upstream IS NOT NULL")
     retention_days = int(os.environ.get("AGENTCOST_RETENTION_DAYS", "180"))
     cutoff = (datetime.now() - timedelta(days=retention_days)).strftime("%Y-%m-%d %H:%M:%S")
@@ -424,8 +428,8 @@ def build_db(records, db_path):
             (agent, ts, model, provider, upstream, base_url, billing_mode, price_in, price_out,
              cwd, originator,
              input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-             reasoning_tokens, total_tokens, cost_usd, source)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             reasoning_tokens, total_tokens, cost_usd, source, user)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             r.get("agent"),
             normalize_ts(r.get("ts")),
@@ -446,6 +450,7 @@ def build_db(records, db_path):
             r.get("total_tokens", 0),
             r.get("cost_usd"),
             "parser",
+            DEFAULT_USER,
         ))
     conn.commit()
     conn.close()
