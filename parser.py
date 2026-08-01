@@ -9,6 +9,8 @@ import glob
 import os
 import re
 import sqlite3
+import hashlib
+import argparse
 import urllib.request
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -293,6 +295,7 @@ def parse_codex_session(path):
                         ts = d.get("timestamp", "")
                         records.append({
                             "ts": ts,
+                            "_source": os.path.realpath(path),
                             "usage": last_usage,
                             "model": session_model,
                             "provider": session_meta.get("model_provider", ""),
@@ -327,6 +330,7 @@ def parse_claude_session(path):
                     if usage.get("input_tokens") or usage.get("output_tokens") or usage.get("cache_read_input_tokens") or usage.get("cache_creation_input_tokens"):
                         records.append({
                             "ts": d.get("timestamp", ""),
+                            "_source": os.path.realpath(path),
                             "usage": usage,
                             "model": msg.get("model", ""),
                             "cwd": d.get("cwd", ""),
@@ -439,6 +443,7 @@ def scan_all():
         recs = parse_codex_session(path)
         for r in recs:
             r["agent"] = "codex"
+            r["_source"] = os.path.realpath(path)
         all_records.extend(recs)
 
     # Claude Code
@@ -446,13 +451,17 @@ def scan_all():
         recs = parse_claude_session(path)
         for r in recs:
             r["agent"] = "claude"
+            r["_source"] = os.path.realpath(path)
             r["base_url"] = ""
             r["billing_mode_raw"] = ""
             r["upstream"] = resolve_upstream(r.get("provider", ""), "", r.get("model") or "")
         all_records.extend(recs)
 
     # Hermes
-    all_records.extend(scan_hermes())
+    hermes_records = scan_hermes()
+    for r in hermes_records:
+        r["_source"] = os.path.realpath(HERMES_DB)
+    all_records.extend(hermes_records)
 
     # 计算成本（Hermes 自带成本则保留）
     for r in all_records:
@@ -491,6 +500,65 @@ def normalize_ts(ts):
         return dt.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return str(ts)
+
+
+def usage_token_value(usage, name):
+    try:
+        return int(usage.get(name) or 0)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return 0
+
+
+def parser_request_id(record):
+    """生成解析器记录的稳定 ID，保证重复扫描不会重复累计。"""
+    usage = record.get("usage") or {}
+    record_user = record.get("user") or DEFAULT_USER or ""
+    parts = (
+        record_user, record.get("agent", ""), record.get("_source", ""),
+        normalize_ts(record.get("ts")) or "", record.get("model", ""),
+        usage_token_value(usage, "input_tokens"), usage_token_value(usage, "output_tokens"),
+        usage_token_value(usage, "cache_read_input_tokens"),
+        usage_token_value(usage, "cache_creation_input_tokens"),
+        usage_token_value(usage, "reasoning_output_tokens"),
+    )
+    digest = hashlib.sha1("\x1f".join(map(str, parts)).encode("utf-8")).hexdigest()
+    return "parser:%s:%s" % (record.get("agent") or "unknown", digest)
+
+
+def clean_duplicates(db_path):
+    """一次性清理 parser 历史重复数据，返回删除的行数。
+
+    新记录按 request_id 去重；旧记录没有 request_id 时按原有的用量组合去重。
+    API 接入记录不在本清理范围内。
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            DELETE FROM usage_records
+            WHERE source = 'parser' AND request_id IS NOT NULL
+              AND id NOT IN (
+                SELECT MIN(id) FROM usage_records
+                WHERE source = 'parser' AND request_id IS NOT NULL
+                GROUP BY request_id
+              )
+        """)
+        removed = cur.rowcount
+        cur.execute("""
+            DELETE FROM usage_records
+            WHERE source = 'parser' AND request_id IS NULL
+              AND id NOT IN (
+                SELECT MIN(id) FROM usage_records
+                WHERE source = 'parser' AND request_id IS NULL
+                GROUP BY ts, model, agent, user, input_tokens, output_tokens,
+                         cache_read_tokens, cache_write_tokens
+              )
+        """)
+        removed += cur.rowcount
+        conn.commit()
+        return removed
+    finally:
+        conn.close()
 
 
 def build_db(records, db_path):
@@ -532,19 +600,43 @@ def build_db(records, db_path):
         cur.execute("ALTER TABLE usage_records ADD COLUMN request_id TEXT")
     if "user" not in cols:
         cur.execute("ALTER TABLE usage_records ADD COLUMN user TEXT")
+    cur.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_parser_request
+                   ON usage_records(request_id)
+                   WHERE source = 'parser' AND request_id IS NOT NULL""")
     cur.execute("UPDATE usage_records SET upstream = lower(upstream) WHERE upstream IS NOT NULL")
     retention_days = int(os.environ.get("AGENTCOST_RETENTION_DAYS", "180"))
     cutoff = (datetime.now() - timedelta(days=retention_days)).strftime("%Y-%m-%d %H:%M:%S")
     cur.execute("DELETE FROM usage_records WHERE source = 'parser' AND ts < ?", (cutoff,))
     for r in records:
         u = r.get("usage") or {}
+        request_id = parser_request_id(r)
+        # 旧版本没有 request_id。将已去重的历史行就地迁移为当前扫描的 ID，
+        # 避免升级后的第一次扫描再把同一条记录插入一遍。
+        legacy = cur.execute("""
+            SELECT id FROM usage_records
+            WHERE source = 'parser' AND request_id IS NULL
+              AND ts = ? AND model IS ? AND agent IS ? AND user IS ?
+              AND input_tokens = ? AND output_tokens = ?
+              AND cache_read_tokens = ? AND cache_write_tokens = ?
+            ORDER BY id LIMIT 1
+        """, (
+            normalize_ts(r.get("ts")), r.get("model"), r.get("agent"), r.get("user") or DEFAULT_USER,
+            u.get("input_tokens", 0), u.get("output_tokens", 0),
+            u.get("cache_read_input_tokens", 0), u.get("cache_creation_input_tokens", 0),
+        )).fetchone()
+        if legacy and not cur.execute(
+            "SELECT 1 FROM usage_records WHERE source = 'parser' AND request_id = ?", (request_id,)
+        ).fetchone():
+            cur.execute("UPDATE usage_records SET request_id = ? WHERE id = ?", (request_id, legacy[0]))
         cur.execute("""
             INSERT INTO usage_records
             (agent, ts, model, provider, upstream, base_url, billing_mode, price_in, price_out,
              cwd, originator,
              input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-             reasoning_tokens, total_tokens, cost_usd, source, user)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            reasoning_tokens, total_tokens, cost_usd, source, request_id, user)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(request_id) WHERE source = 'parser' AND request_id IS NOT NULL
+            DO NOTHING
         """, (
             r.get("agent"),
             normalize_ts(r.get("ts")),
@@ -565,13 +657,24 @@ def build_db(records, db_path):
             r.get("total_tokens", 0),
             r.get("cost_usd"),
             "parser",
-            DEFAULT_USER,
+            request_id,
+            r.get("user") or DEFAULT_USER,
         ))
     conn.commit()
     conn.close()
 
 
 def main():
+    arg_parser = argparse.ArgumentParser(description="扫描本地 Agent 用量记录")
+    arg_parser.add_argument("--dedupe", action="store_true", help="一次性清理 parser 历史重复记录")
+    args = arg_parser.parse_args()
+    db_path = os.path.join(DB_DIR, "agentcost.db")
+    if args.dedupe:
+        if not os.path.exists(db_path):
+            print(f"数据库不存在: {db_path}")
+            return
+        print(f"已清理 {clean_duplicates(db_path)} 条 parser 重复记录")
+        return
     load_overrides()
     load_official_prices()
     records = scan_all()
@@ -586,7 +689,6 @@ def main():
     print(f"按模型: {dict(by_model)}")
     print(f"总 token: {total_tokens:,}  估算成本: ${total_cost:.4f}")
     if records:
-        db_path = os.path.join(DB_DIR, "agentcost.db")
         build_db(records, db_path)
         print(f"已写入 {db_path}")
     else:

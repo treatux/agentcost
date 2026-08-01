@@ -20,7 +20,7 @@ import threading
 import urllib.request
 import parser as cost_parser
 from datetime import datetime, timedelta
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 __version__ = "1.3.0"
@@ -35,9 +35,19 @@ OVERRIDE_PATH = os.path.join(DB_DIR, "models_override.json")
 CONFIG_PATH = os.path.join(DB_DIR, "config.json")
 USERS_PATH = os.path.join(DB_DIR, "users.json")
 PORT = int(os.environ.get("AGENTCOST_PORT", "8666"))
+HOST = os.environ.get("AGENTCOST_HOST", "127.0.0.1")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 AUTO_REFRESH_SECONDS = int(os.environ.get("AGENTCOST_REFRESH_SECONDS", "300"))  # 默认每 5 分钟自动刷新
 _last_price_fetch_date = None
+
+
+def get_conn():
+    """打开适合并发读写的 SQLite 连接。"""
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
 
 # ---- 自动刷新：定时重跑 parser 更新 DB ----
 def run_parser():
@@ -130,7 +140,7 @@ def save_models_override(ovr):
 
 def model_catalog(user=None):
     """返回所有已知模型 + 当前上游/价格 + 是否被用户覆盖。"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
     where = ""
     params = ()
@@ -211,7 +221,7 @@ def send_webhook(text):
 def check_budget_and_notify():
     """刷新后检查预算，超阈值且冷却期外则发 webhook。"""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_conn()
         cur = conn.cursor()
         month_start = datetime.now().strftime("%Y-%m-01")
         row = cur.execute(
@@ -265,7 +275,7 @@ def check_anomaly_and_notify():
         return
     try:
         today = datetime.now().strftime("%Y-%m-%d")
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_conn()
         cur = conn.cursor()
         cost_today = cur.execute(
             "SELECT COALESCE(SUM(cost_usd), 0) FROM usage_records WHERE ts LIKE ?",
@@ -497,7 +507,35 @@ def fetch_fx_rate():
 
 # ---- 用户与认证 ----
 def password_hash(password):
+    """旧版 SHA-256 哈希，仅用于兼容无 salt 的历史 users.json。"""
     return hashlib.sha256(str(password).encode("utf-8")).hexdigest()
+
+
+def password_hash_pbkdf2(password, salt=None):
+    """返回 (PBKDF2-SHA256 哈希, hex salt)。"""
+    salt_bytes = bytes.fromhex(salt) if salt else secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", str(password).encode("utf-8"), salt_bytes, 100000)
+    return digest.hex(), salt_bytes.hex()
+
+
+def make_user_entry(password, role="user"):
+    digest, salt = password_hash_pbkdf2(password)
+    return {"password_hash": digest, "salt": salt, "role": role}
+
+
+def verify_password(entry, password):
+    """验证 PBKDF2 新条目，兼容旧的无 salt SHA-256 条目。"""
+    if not isinstance(entry, dict):
+        return False, False
+    stored = str(entry.get("password_hash") or "")
+    salt = entry.get("salt")
+    if salt:
+        try:
+            candidate, _ = password_hash_pbkdf2(password, str(salt))
+        except (TypeError, ValueError):
+            return False, False
+        return hmac.compare_digest(stored, candidate), False
+    return bool(stored) and hmac.compare_digest(stored, password_hash(password)), True
 
 
 def load_users():
@@ -509,7 +547,7 @@ def load_users():
             raise ValueError("用户文件格式错误")
         return users
     except FileNotFoundError:
-        users = {"agentcost": {"password_hash": password_hash("Ac@2026!dash"), "role": "admin"}}
+        users = {"agentcost": make_user_entry("Ac@2026!dash", "admin")}
         save_users(users)
         return users
     except Exception:
@@ -524,11 +562,45 @@ def save_users(users):
 # 内存 token 表: token -> {user, role, exp}
 TOKENS = {}
 TOKEN_TTL = timedelta(hours=12)
+TOKEN_LIMIT = 1000
+LOGIN_FAILURES = {}  # (username, IP) -> {count, locked_until}
+AUTH_LOCK = threading.Lock()
+
+
+def login_key(username, client_ip):
+    return (str(username), str(client_ip))
+
+
+def login_locked(username, client_ip):
+    with AUTH_LOCK:
+        state = LOGIN_FAILURES.get(login_key(username, client_ip))
+        return bool(state and state.get("locked_until", 0) > time.time())
+
+
+def record_login_failure(username, client_ip):
+    with AUTH_LOCK:
+        key = login_key(username, client_ip)
+        state = LOGIN_FAILURES.get(key, {"count": 0, "locked_until": 0})
+        state["count"] += 1
+        if state["count"] >= 5:
+            state["locked_until"] = time.time() + 300
+            state["count"] = 0
+        LOGIN_FAILURES[key] = state
+        return state["locked_until"] > time.time()
+
+
+def clear_login_failures(username, client_ip):
+    with AUTH_LOCK:
+        LOGIN_FAILURES.pop(login_key(username, client_ip), None)
 
 
 def make_token(username, role="user"):
     token = secrets.token_urlsafe(32)
-    TOKENS[token] = {"user": username, "role": role, "exp": datetime.now() + TOKEN_TTL}
+    with AUTH_LOCK:
+        # dict 保持插入顺序；满额时逐出最早创建的 token。
+        while len(TOKENS) >= TOKEN_LIMIT:
+            TOKENS.pop(next(iter(TOKENS)))
+        TOKENS[token] = {"user": username, "role": role, "exp": datetime.now() + TOKEN_TTL}
     return token
 
 
@@ -540,13 +612,14 @@ def check_token(token):
 def get_token_info(token):
     if not token:
         return None
-    info = TOKENS.get(token)
-    if not info:
-        return None
-    if datetime.now() > info["exp"]:
-        TOKENS.pop(token, None)
-        return None
-    return {"user": info["user"], "role": info.get("role", "user")}
+    with AUTH_LOCK:
+        info = TOKENS.get(token)
+        if not info:
+            return None
+        if datetime.now() > info["exp"]:
+            TOKENS.pop(token, None)
+            return None
+        return {"user": info["user"], "role": info.get("role", "user")}
 
 
 def get_share_info(token):
@@ -560,7 +633,7 @@ def get_share_info(token):
 
 
 def query_db(sql, params=()):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     rows = cur.execute(sql, params).fetchall()
@@ -569,15 +642,27 @@ def query_db(sql, params=()):
 
 
 def ensure_usage_schema():
-    """为已有数据库补齐多用户列，不重建历史数据。"""
+    """为已有数据库补齐字段并建立常用查询/幂等索引。"""
     if not os.path.exists(DB_PATH):
         return
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     try:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(usage_records)").fetchall()}
+        if cols and "source" not in cols:
+            conn.execute("ALTER TABLE usage_records ADD COLUMN source TEXT DEFAULT 'parser'")
         if cols and "user" not in cols:
             conn.execute("ALTER TABLE usage_records ADD COLUMN user TEXT")
-            conn.commit()
+        if cols and "request_id" not in cols:
+            conn.execute("ALTER TABLE usage_records ADD COLUMN request_id TEXT")
+        if cols:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_records_ts ON usage_records(ts)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_records_user ON usage_records(user)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_records_model ON usage_records(model)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_records_upstream ON usage_records(upstream)")
+            conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_parser_request
+                            ON usage_records(request_id)
+                            WHERE source = 'parser' AND request_id IS NOT NULL""")
+        conn.commit()
     except sqlite3.Error:
         pass
     finally:
@@ -804,15 +889,22 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_file(self, path):
-        if not os.path.exists(path):
+        # 所有静态响应都必须留在 STATIC_DIR 内，禁止 /static/../../... 路径穿越。
+        static_root = os.path.realpath(STATIC_DIR)
+        real_path = os.path.realpath(path)
+        try:
+            inside_static = os.path.commonpath((static_root, real_path)) == static_root
+        except ValueError:
+            inside_static = False
+        if not inside_static or not os.path.isfile(real_path):
             self.send_error(404)
             return
-        with open(path, "rb") as f:
+        with open(real_path, "rb") as f:
             body = f.read()
         ctype = "text/html; charset=utf-8"
-        if path.endswith(".js"):
+        if real_path.endswith(".js"):
             ctype = "application/javascript; charset=utf-8"
-        elif path.endswith(".css"):
+        elif real_path.endswith(".css"):
             ctype = "text/css; charset=utf-8"
         self.send_response(200)
         self.send_header("Content-Type", ctype)
@@ -904,7 +996,7 @@ class Handler(BaseHTTPRequestHandler):
                 request_id, record_user,
             ))
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_conn()
         try:
             cur = conn.cursor()
             cols = {row[1] for row in cur.execute("PRAGMA table_info(usage_records)").fetchall()}
@@ -947,15 +1039,28 @@ class Handler(BaseHTTPRequestHandler):
             data = self.read_body()
             username = data.get("username", "")
             password = data.get("password", "")
+            client_ip = self.client_address[0]
+            if login_locked(username, client_ip):
+                self.send_json({"ok": False, "error": "登录失败次数过多，请 5 分钟后重试"}, status=429)
+                return
             users = load_users()
             entry = users.get(username) if isinstance(username, str) else None
-            stored = entry.get("password_hash", "") if isinstance(entry, dict) else ""
             role = entry.get("role", "user") if isinstance(entry, dict) else "user"
-            if stored and hmac.compare_digest(stored, password_hash(password)):
+            valid, legacy = verify_password(entry, password)
+            if valid:
+                # 成功使用旧 SHA-256 登录后就地升级，users.json 之后仅写 PBKDF2 条目。
+                if legacy:
+                    users[username] = make_user_entry(password, role)
+                    save_users(users)
+                clear_login_failures(username, client_ip)
                 token = make_token(username, role)
                 self.send_json({"ok": True, "token": token, "user": username, "role": role})
             else:
-                self.send_json({"ok": False, "error": "用户名或密码错误"}, status=401)
+                locked = record_login_failure(username, client_ip)
+                if locked:
+                    self.send_json({"ok": False, "error": "登录失败次数过多，请 5 分钟后重试"}, status=429)
+                else:
+                    self.send_json({"ok": False, "error": "用户名或密码错误"}, status=401)
         elif self.path == "/api/ingest":
             auth_kind, token_info = self.check_ingest_auth()
             if not auth_kind:
@@ -983,9 +1088,10 @@ class Handler(BaseHTTPRequestHandler):
             username = username.strip()
             users = load_users()
             old = users.get(username, {})
-            entry = {"password_hash": old.get("password_hash", ""), "role": role}
+            entry = dict(old) if isinstance(old, dict) else {}
+            entry["role"] = role
             if password:
-                entry["password_hash"] = password_hash(password)
+                entry = make_user_entry(password, role)
             if not entry["password_hash"]:
                 self.send_json({"ok": False, "error": "新用户必须提供 password"}, status=400)
                 return
@@ -1074,7 +1180,7 @@ class Handler(BaseHTTPRequestHandler):
     def send_export_csv(self, frm, to, user=None):
         """导出所选范围的用量明细为 CSV。"""
         to_next = (datetime.strptime(to, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_conn()
         where = "ts >= ? AND ts < ?" + (" AND user = ?" if user else "")
         rows = conn.execute(f"""
             SELECT ts, agent, model, upstream, billing_mode,
@@ -1125,7 +1231,7 @@ class Handler(BaseHTTPRequestHandler):
             records = 0
             db_ok = False
             try:
-                conn = sqlite3.connect(DB_PATH)
+                conn = get_conn()
                 try:
                     records = conn.execute("SELECT COUNT(*) FROM usage_records").fetchone()[0]
                     db_ok = True
@@ -1283,7 +1389,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    print(f"AgentCost v3 仪表盘: http://localhost:{PORT}")
+    print(f"AgentCost v3 仪表盘: http://{HOST}:{PORT}")
     print(f"自动刷新: 每 {AUTO_REFRESH_SECONDS} 秒")
     # 自定义数据目录（例如 Docker 的 /data）可能尚不存在。
     os.makedirs(DB_DIR, exist_ok=True)
@@ -1293,7 +1399,7 @@ def main():
     ensure_usage_schema()
     # 启动自动刷新线程（守护线程，随主进程退出）
     threading.Thread(target=auto_refresh_loop, daemon=True).start()
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
