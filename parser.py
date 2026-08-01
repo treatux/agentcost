@@ -239,6 +239,24 @@ def parse_claude_session(path):
     return records
 
 
+def normalize_usage(usage):
+    """统一各来源的 usage 字段名。
+
+    Codex 日志用 cached_input_tokens / cache_write_input_tokens；
+    Claude/Anthropic 用 cache_read_input_tokens / cache_creation_input_tokens；
+    Hermes 的 scan_hermes() 已映射成后者。此函数把所有来源归一化到
+    cache_read_input_tokens / cache_creation_input_tokens（幂等）。
+    """
+    if not isinstance(usage, dict):
+        return usage or {}
+    u = dict(usage)
+    if "cached_input_tokens" in u and "cache_read_input_tokens" not in u:
+        u["cache_read_input_tokens"] = u.pop("cached_input_tokens")
+    if "cache_write_input_tokens" in u and "cache_creation_input_tokens" not in u:
+        u["cache_creation_input_tokens"] = u.pop("cache_write_input_tokens")
+    return u
+
+
 def estimate_cost(model, usage, upstream="custom", billing_mode="api"):
     """根据上游价格估算美元成本。"""
     if billing_mode == "coding_plan":
@@ -322,6 +340,7 @@ def scan_all():
 
     # 计算成本（Hermes 自带成本则保留）
     for r in all_records:
+        r["usage"] = normalize_usage(r.get("usage") or {})
         r["billing_mode"] = get_billing_mode(r.get("model"), r.get("provider"), r.get("upstream"))
         if r["billing_mode"] == "coding_plan":
             r["cost_usd"] = 0
