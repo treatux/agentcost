@@ -100,7 +100,7 @@
     .modal { padding: 20px 16px; }
     .modal .row { flex-direction: column; gap: 10px; }
   }
-  .scroll-box { max-height: 300px; overflow-y: auto; border-radius: 8px; min-width: 0; max-width: 100%; }
+  .scroll-box { max-height: 300px; overflow: auto; border-radius: 8px; min-width: 0; max-width: 100%; }
   .grid2 > * { min-width: 0; }
   .panel { max-width: 100%; }
   .scroll-box::-webkit-scrollbar { width: 6px; }
@@ -190,7 +190,7 @@
 const TOKEN_KEY = 'agentcost_token';
 const ROLE_KEY = 'agentcost_role';
 const CURRENCY_KEY = 'agentcost_currency';
-let state = { from: '', to: '', fx: 7.1, agent: '', upstream: '', model: '', user: '', role: '', readonly: false, filters: { agents: [], upstreams: [], models: [], users: [] }, dim_bar: 'tokens', dim_line: 'tokens', dim_donut: 'cost', donut_group: 'model' };
+let state = { from: '', to: '', fx: 7.1, agent: '', upstream: '', model: '', user: '', cwd: '', role: '', readonly: false, filters: { agents: [], upstreams: [], models: [], projects: [], users: [] }, dim_bar: 'tokens', dim_line: 'tokens', dim_donut: 'cost', donut_group: 'model', records_offset: 0 };
 let lastScanAt = null;
 
 const DIMS = [
@@ -471,7 +471,7 @@ function bindChartTabs() {
         const isBar = container.id === 'barPanel';
         const isDonut = container.id === 'donutPanel';
         if(isBar) state.dim_bar=dim; else if(isDonut) state.dim_donut=dim; else state.dim_line=dim;
-        const newHtml = isBar ? svgBarChart(window.__barData || [], dim) : isDonut ? svgDonutChart(window.__donutData || [], dim) : svgLineChart(window.__lineData || [], dim);
+        const newHtml = isBar ? svgBarChart(window.__barData || [], dim) : isDonut ? svgDonutChart(window.__activeDonutData || [], dim) : svgLineChart(window.__lineData || [], dim);
         // 提取纯 svg 替换，避免 chart-box 嵌套
         const m = newHtml.match(/<svg[\s\S]*<\/svg>/);
         if (chartBox) { if (m) chartBox.innerHTML = m[0]; else chartBox.innerHTML = newHtml; }
@@ -483,7 +483,7 @@ function bindChartTabs() {
 }
 function bindChartClicks(){
   document.querySelectorAll('.bar-hit').forEach(el=>el.addEventListener('click',()=>{ state.model=el.dataset.model; const s=document.getElementById('filterModel'); if(s) s.value=state.model; load(); }));
-  document.querySelectorAll('.donut-hit').forEach(el=>el.addEventListener('click',()=>{ const g=state.donut_group||'model'; if(g==='model'){state.model=el.dataset.label; const s=document.getElementById('filterModel'); if(s)s.value=state.model;} else if(g==='upstream'){state.upstream=el.dataset.label; const s=document.getElementById('filterUp'); if(s)s.value=state.upstream;} else if(g==='user'){state.user=el.dataset.label; const s=document.getElementById('filterUser'); if(s)s.value=state.user;} else {state.agent=el.dataset.label; const s=document.getElementById('filterAgent'); if(s)s.value=state.agent;} load(); }));
+  document.querySelectorAll('.donut-hit').forEach(el=>el.addEventListener('click',()=>{ const g=state.donut_group||'model'; if(g==='model'){state.model=el.dataset.label; const s=document.getElementById('filterModel'); if(s)s.value=state.model;} else if(g==='upstream'){state.upstream=el.dataset.label; const s=document.getElementById('filterUp'); if(s)s.value=state.upstream;} else if(g==='user'){state.user=el.dataset.label; const s=document.getElementById('filterUser'); if(s)s.value=state.user;} else if(g==='project'){state.cwd=el.dataset.label; const s=document.getElementById('filterProject'); if(s)s.value=state.cwd;} else {state.agent=el.dataset.label; const s=document.getElementById('filterAgent'); if(s)s.value=state.agent;} load(); }));
   document.querySelectorAll('.stack-legend').forEach(el=>el.addEventListener('click',()=>{ window.__stackHidden=window.__stackHidden||{}; const k=el.dataset.layer; window.__stackHidden[k]=!window.__stackHidden[k]; const p=document.getElementById('stackPanel'); if(p){ const box=p.querySelector('.chart-box'); box.outerHTML=svgStackChart(window.__lineData||[]); bindChartHover(); bindChartClicks(); }}));
 }
 function todayStr() { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); }
@@ -567,6 +567,9 @@ function renderToolbar() {
       <select class="cur-select" id="filterModel" aria-label="模型筛选">
         ${filterOptions(state.filters.models || [], state.model, '全部模型')}
       </select>
+      <select class="cur-select" id="filterProject" aria-label="项目筛选">
+        ${filterOptions(state.filters.projects || [], state.cwd, '全部项目')}
+      </select>
       <div class="spacer"></div>
       ${state.readonly ? '' : '<button class="logout" id="exportBtn">⬇ 导出</button>'}
       <select class="cur-select" id="curSel">
@@ -611,6 +614,10 @@ function render(el, d) {
   const byAgentHtml = d.by_agent.map(a => `
     <tr><td><span class="tag tag-${agentTags[a.agent] || 'codex'}">${a.agent}</span></td>
     <td class="num">${a.cnt || 0}</td><td class="num">${fmtTokens(a.tokens)}</td><td class="num">${fmtCost(a.cost)}</td></tr>`).join('');
+  const projectTip = p => `输入: ${fmtTokens(p.inp_tokens)} · 输出: ${fmtTokens(p.out_tokens)}&#10;缓存读/写: ${fmtTokens(p.cr_tokens)} / ${fmtTokens(p.cw_tokens)} · 推理: ${fmtTokens(p.reasoning_tokens)}&#10;总 Token: ${fmtTokens(p.tokens)}`;
+  const byProjectHtml = (d.by_project || []).map(p => `<tr title="${projectTip(p)}"><td><button class="model-link project-link" type="button" data-cwd="${escHtml(p.cwd)}" title="筛选项目：${escHtml(p.cwd)}">${escHtml(p.cwd)}</button></td><td class="num">${p.cnt || 0}</td><td class="num">${fmtTokens(p.tokens)}</td><td class="num">${fmtCost(p.cost)}</td></tr>`).join('') || '<tr><td colspan="4" class="muted">范围内无项目数据</td></tr>';
+  const recordData = d.records || { total: 0, records: [] };
+  const recordsHtml = (recordData.records || []).map(r => `<tr><td>${escHtml(r.ts)}</td><td>${escHtml(r.agent || '—')}</td><td><button class="model-link" type="button" data-model="${escHtml(r.model || '')}">${escHtml(r.model || '—')}</button></td><td>${escHtml(r.upstream || '—')}</td><td title="${escHtml(r.cwd || '')}">${escHtml((r.cwd || '—').split('/').filter(Boolean).pop() || '—')}</td><td class="num">${fmtTokens(r.input_tokens)}</td><td class="num">${fmtTokens(r.output_tokens)}</td><td class="num">${fmtTokens(r.cache_read_tokens)}</td><td class="num">${fmtTokens(r.cache_write_tokens)}</td><td class="num">${fmtTokens(r.reasoning_tokens)}</td><td class="num">${fmtTokens(r.total_tokens)}</td><td class="num">¥${Number(r.cost_cny || 0).toFixed(2)}</td></tr>`).join('') || '<tr><td colspan="12" class="muted">范围内无明细</td></tr>';
   const maxModel = Math.max(...d.by_model.map(m => m.tokens), 1);
   const upstreamNames = { wanlai: 'Wanlai', sub2api: 'sub2api', omniroute: 'OmniRoute', deepseek: 'DeepSeek', nvidia: 'NVIDIA', custom: '自定义', auto: '自动', anthropic: 'Anthropic', openai: 'OpenAI' };
   const byModelHtml = d.by_model.map(m => {
@@ -646,9 +653,11 @@ function render(el, d) {
   window.__donutData = d.by_model.map(m => ({...m,label: m.model || 'unknown'}));
   window.__agentData = d.by_agent.map(a => ({...a,label:a.agent||'unknown'}));
   window.__userData = (d.by_user || []).map(u => ({...u,label:u.user||'unknown'}));
+  window.__projectData = (d.by_project || []).map(p => ({...p,label:p.cwd||'unknown'}));
   window.__lineData = d.daily;
   const donutGroup = state.donut_group || 'model';
-  const donutItems = donutGroup==='model' ? (()=>{const a=window.__donutData.slice(0,10), rest=window.__donutData.slice(10); if(rest.length){const o={label:'其他'}; rest.forEach(m=>['cost','tokens','cnt','inp_tokens','out_tokens','reasoning_tokens','cr_tokens','cw_tokens','saved_usd'].forEach(x=>o[x]=(o[x]||0)+(m[x]||0))); a.push(o);} return a;})() : donutGroup==='agent' ? window.__agentData : donutGroup==='user' ? window.__userData : Object.values(window.__donutData.reduce((a,m)=>{const k=m.upstream||'unknown'; if(!a[k]) a[k]={label:k}; ['cost','tokens','cnt','inp_tokens','out_tokens','reasoning_tokens','cr_tokens','cw_tokens','saved_usd'].forEach(x=>a[k][x]=(a[k][x]||0)+(m[x]||0)); return a;},{}));
+  const donutItems = donutGroup==='model' ? (()=>{const a=window.__donutData.slice(0,10), rest=window.__donutData.slice(10); if(rest.length){const o={label:'其他'}; rest.forEach(m=>['cost','tokens','cnt','inp_tokens','out_tokens','reasoning_tokens','cr_tokens','cw_tokens','saved_usd'].forEach(x=>o[x]=(o[x]||0)+(m[x]||0))); a.push(o);} return a;})() : donutGroup==='agent' ? window.__agentData : donutGroup==='user' ? window.__userData : donutGroup==='project' ? window.__projectData : Object.values(window.__donutData.reduce((a,m)=>{const k=m.upstream||'unknown'; if(!a[k]) a[k]={label:k}; ['cost','tokens','cnt','inp_tokens','out_tokens','reasoning_tokens','cr_tokens','cw_tokens','saved_usd'].forEach(x=>a[k][x]=(a[k][x]||0)+(m[x]||0)); return a;},{}));
+  window.__activeDonutData = donutItems;
   const lineChart = svgLineChart(d.daily, state.dim_line || 'tokens');
   const stackChart = svgStackChart(window.__lineData);
   const barChart = svgBarChart(d.by_model.slice(0, 10), state.dim_bar || 'tokens');
@@ -664,13 +673,15 @@ function render(el, d) {
       <div class="cards">${cards.map(c => `<div class="card"><div class="label">${c.label}</div><div class="value">${c.value}<small>${c.sub}</small></div></div>`).join('')}</div>
       ${budgetHtml}
       <div class="panel" id="barPanel"><h2>模型对比 (Top 10)</h2>${chartTabs('barTabs', state.dim_bar || 'tokens','bar')}<div class="chart-note">悬停柱子查看详情</div>${barChart}</div>
-      <div class="panel" id="donutPanel"><h2>成本分布 · 按${donutGroup==='model'?'模型':donutGroup==='upstream'?'上游':donutGroup==='user'?'用户':'Agent'}</h2>${chartTabs('donutTabs', state.dim_donut || 'cost','donut')}<div style="margin:0 0 10px"><select class="cur-select" id="donutGroup"><option value="model" ${donutGroup==='model'?'selected':''}>按模型</option><option value="upstream" ${donutGroup==='upstream'?'selected':''}>按上游</option><option value="agent" ${donutGroup==='agent'?'selected':''}>按 Agent</option>${state.role === 'admin' && !state.readonly ? `<option value="user" ${donutGroup==='user'?'selected':''}>按用户</option>` : ''}</select></div><div class="chart-note">按分组占比</div>${donutChart}</div>
+      <div class="panel" id="donutPanel"><h2>成本分布 · 按${donutGroup==='model'?'模型':donutGroup==='upstream'?'上游':donutGroup==='user'?'用户':donutGroup==='project'?'项目':'Agent'}</h2>${chartTabs('donutTabs', state.dim_donut || 'cost','donut')}<div style="margin:0 0 10px"><select class="cur-select" id="donutGroup"><option value="model" ${donutGroup==='model'?'selected':''}>按模型</option><option value="upstream" ${donutGroup==='upstream'?'selected':''}>按上游</option><option value="agent" ${donutGroup==='agent'?'selected':''}>按 Agent</option><option value="project" ${donutGroup==='project'?'selected':''}>按项目</option>${state.role === 'admin' && !state.readonly ? `<option value="user" ${donutGroup==='user'?'selected':''}>按用户</option>` : ''}</select></div><div class="chart-note">按分组占比</div>${donutChart}</div>
       <div class="grid2">
         <div class="panel"><h2>按 Agent</h2><div class="scroll-box"><table><tr><th>来源</th><th>请求数</th><th>Tokens</th><th>成本</th></tr>${byAgentHtml}</table></div></div>
         <div class="panel"><h2>按模型</h2><div class="scroll-box"><table><tr><th>模型</th><th>上游</th><th>计费</th><th>价格(入/出)</th><th>缓存率·价</th><th></th><th>Tokens</th><th>成本</th><th>缓存节省</th></tr>${byModelHtml}</table></div></div>
       </div>
+      <div class="panel"><h2>按项目</h2><div class="chart-note">悬停项目查看 Token 结构，点击项目名筛选</div><div class="scroll-box"><table><tr><th>项目</th><th>请求数</th><th>Tokens</th><th>成本</th></tr>${byProjectHtml}</table></div></div>
       <div class="panel" id="linePanel"><h2>每日趋势${state.model ? ' · ' + escHtml(state.model) : ''}</h2>${chartTabs('lineTabs', state.dim_line || 'tokens','line')}<div class="chart-note">悬停数据点查看详情</div>${lineChart}<table><tr><th>日期</th><th></th><th>Tokens</th><th>成本</th></tr>${dailyHtml || '<tr><td colspan="4" class="muted">范围内无数据</td></tr>'}</table></div>
       <div class="panel" id="stackPanel"><h2>Token 结构</h2><div class="chart-note">输入、输出、缓存与推理 Token 的每日堆叠趋势；悬停查看明细</div>${stackChart}</div>
+      <div class="panel" id="recordsPanel"><div style="display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:14px"><h2 style="margin:0">会话明细</h2><div class="muted" style="font-size:12px">共 ${recordData.total || 0} 条</div></div><div class="scroll-box"><table style="min-width:1200px"><tr><th>时间</th><th>Agent</th><th>模型</th><th>上游</th><th>项目</th><th>输入</th><th>输出</th><th>缓存读</th><th>缓存写</th><th>推理</th><th>Tokens</th><th>成本(¥)</th></tr>${recordsHtml}</table></div><div style="display:flex;justify-content:flex-end;gap:8px;align-items:center;margin-top:12px"><button class="cur-toggle" id="recordsPrev" ${state.records_offset <= 0 ? 'disabled' : ''}>上一页</button><span class="muted" style="font-size:12px">${Math.floor(state.records_offset / 100) + 1} / ${Math.max(1, Math.ceil((recordData.total || 0) / 100))}</span><button class="cur-toggle" id="recordsNext" ${state.records_offset + 100 >= (recordData.total || 0) ? 'disabled' : ''}>下一页</button></div></div>
     </div>`;
   bindToolbar();
   bindChartHover();
@@ -681,8 +692,8 @@ function render(el, d) {
 }
 
 function bindToolbar() {
-  document.getElementById('from').onchange = load;
-  document.getElementById('to').onchange = load;
+  document.getElementById('from').onchange = () => { state.records_offset = 0; load(); };
+  document.getElementById('to').onchange = () => { state.records_offset = 0; load(); };
   const logout = document.getElementById('logout');
   if (logout) logout.onclick = () => { localStorage.removeItem(TOKEN_KEY); localStorage.removeItem(ROLE_KEY); state.role = ''; state.user = ''; renderLogin(); };
   const exportBtn = document.getElementById('exportBtn');
@@ -711,26 +722,33 @@ function bindToolbar() {
     setCurrency(e.target.value);
     load();
   };
-  document.getElementById('filterAgent').onchange = (e) => { state.agent = e.target.value; load(); };
+  document.getElementById('filterAgent').onchange = (e) => { state.agent = e.target.value; state.records_offset = 0; load(); };
   const filterUser = document.getElementById('filterUser');
-  if (filterUser) filterUser.onchange = (e) => { state.user = e.target.value; load(); };
-  document.getElementById('filterUp').onchange = (e) => { state.upstream = e.target.value; load(); };
-  document.getElementById('filterModel').onchange = (e) => { state.model = e.target.value; load(); };
+  if (filterUser) filterUser.onchange = (e) => { state.user = e.target.value; state.records_offset = 0; load(); };
+  document.getElementById('filterUp').onchange = (e) => { state.upstream = e.target.value; state.records_offset = 0; load(); };
+  document.getElementById('filterModel').onchange = (e) => { state.model = e.target.value; state.records_offset = 0; load(); };
+  document.getElementById('filterProject').onchange = (e) => { state.cwd = e.target.value; state.records_offset = 0; load(); };
   document.querySelectorAll('.model-link').forEach(button => {
     button.onclick = () => {
       state.model = button.dataset.model;
+      state.records_offset = 0;
       const select = document.getElementById('filterModel');
       if (select) select.value = state.model;
       load();
     };
   });
+  document.querySelectorAll('.project-link').forEach(button => {
+    button.onclick = () => { state.cwd = button.dataset.cwd; state.records_offset = 0; load(); };
+  });
+  document.getElementById('recordsPrev').onclick = () => { state.records_offset = Math.max(0, state.records_offset - 100); load(); };
+  document.getElementById('recordsNext').onclick = () => { state.records_offset += 100; load(); };
   document.querySelectorAll('.quick button').forEach(b => {
     b.onclick = () => {
       const f = document.getElementById('from'); const t = document.getElementById('to');
       if (b.dataset.days) { f.value = daysAgo(+b.dataset.days); t.value = todayStr(); }
       if (b.dataset.month) { f.value = monthStart(); t.value = todayStr(); }
       if (b.dataset.all) { f.value = state.min_ts || '2026-01-01'; t.value = todayStr(); }
-      load();
+      state.records_offset = 0; load();
     };
   });
 }
@@ -743,10 +761,12 @@ async function load() {
   const filterUp = document.getElementById('filterUp');
   const filterModel = document.getElementById('filterModel');
   const filterUser = document.getElementById('filterUser');
+  const filterProject = document.getElementById('filterProject');
   state.agent = filterAgent ? filterAgent.value : state.agent;
   state.upstream = filterUp ? filterUp.value : state.upstream;
   state.model = filterModel ? filterModel.value : state.model;
   state.user = filterUser ? filterUser.value : state.user;
+  state.cwd = filterProject ? filterProject.value : state.cwd;
   try {
     const q = new URLSearchParams();
     if (state.from) q.set('from', state.from);
@@ -754,11 +774,16 @@ async function load() {
     if (state.agent) q.set('agent', state.agent);
     if (state.upstream) q.set('upstream', state.upstream);
     if (state.model) q.set('model', state.model);
+    if (state.cwd) q.set('cwd', state.cwd);
     if (state.role === 'admin' && state.user) q.set('user', state.user);
-    const requests = [api('api/summary?' + q.toString())];
+    const recordsQ = new URLSearchParams(q);
+    recordsQ.set('limit', '100'); recordsQ.set('offset', String(state.records_offset || 0));
+    const requests = [api('api/summary?' + q.toString()), api('api/records?' + recordsQ.toString())];
     if (!state.readonly) requests.push(api('api/config'));
-    const [d, cfgResp] = await Promise.all(requests);
+    const [d, recordsResp, cfgResp] = await Promise.all(requests);
     if (!d.ok) throw new Error(d.error || '加载失败');
+    if (!recordsResp.ok) throw new Error(recordsResp.error || '加载明细失败');
+    d.records = recordsResp;
     state.fx = d.fx || state.fx;
     state.budget = (cfgResp && cfgResp.config) || state.budget || {};
     render(el, d);
@@ -768,7 +793,7 @@ async function load() {
 async function loadFilters() {
   const r = await api('api/filters');
   if (!r.ok) throw new Error(r.error || '加载筛选项失败');
-  state.filters = { agents: r.agents || [], upstreams: r.upstreams || [], models: state.filters.models || [], users: r.users || [] };
+  state.filters = { agents: r.agents || [], upstreams: r.upstreams || [], models: state.filters.models || [], projects: r.projects || [], users: r.users || [] };
 }
 
 /* ---------- 设置弹窗 ---------- */

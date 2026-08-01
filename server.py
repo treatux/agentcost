@@ -677,7 +677,7 @@ def parse_range(params):
     return frm, to
 
 
-def summary(frm, to, agent=None, upstream=None, model=None, group_by="day", user=None):
+def summary(frm, to, agent=None, upstream=None, model=None, group_by="day", user=None, cwd=None):
     """范围汇总。"""
     if group_by not in ("day", "hour"):
         group_by = "day"
@@ -711,6 +711,9 @@ def summary(frm, to, agent=None, upstream=None, model=None, group_by="day", user
     if user:
         filter_cond.append("user = ?")
         filter_params.append(user)
+    if cwd:
+        filter_cond.append("cwd = ?")
+        filter_params.append(cwd)
 
     def filtered(cond, params):
         parts = [cond, *filter_cond]
@@ -820,6 +823,14 @@ def summary(frm, to, agent=None, upstream=None, model=None, group_by="day", user
                SUM(reasoning_tokens) as reasoning_tokens
         FROM usage_records WHERE {range_cond} GROUP BY model, upstream ORDER BY tokens DESC
     """, range_params)
+    by_project = query_db(f"""
+        SELECT cwd, COUNT(*) as cnt, SUM(total_tokens) as tokens, SUM(cost_usd) as cost,
+               SUM(input_tokens) as inp_tokens, SUM(output_tokens) as out_tokens,
+               SUM(cache_read_tokens) as cr_tokens, SUM(cache_write_tokens) as cw_tokens,
+               SUM(reasoning_tokens) as reasoning_tokens
+        FROM usage_records WHERE {range_cond} AND cwd IS NOT NULL AND cwd != ''
+        GROUP BY cwd ORDER BY cost DESC
+    """, range_params)
     day_expr = "substr(ts,1,13)" if group_by == "hour" else "substr(ts,1,10)"
     daily = query_db(f"""
         SELECT {day_expr} as day, COUNT(*) as cnt, SUM(total_tokens) as tokens, SUM(cost_usd) as cost,
@@ -870,6 +881,7 @@ def summary(frm, to, agent=None, upstream=None, model=None, group_by="day", user
         "by_agent": [with_cny(a) for a in by_agent],
         "by_user": [with_cny(u) for u in by_user],
         "by_model": [with_cny(m, ("cost", "saved_usd")) for m in by_model],
+        "by_project": [with_cny(p) for p in by_project],
         "daily": [with_cny(x) for x in daily],
         "forecast_monthly": forecast_monthly,
         "prev": prev,
@@ -1257,12 +1269,47 @@ class Handler(BaseHTTPRequestHandler):
             agent = params.get("agent", [""])[0].strip()
             upstream = params.get("upstream", [""])[0].strip()
             model = params.get("model", [""])[0].strip()
+            cwd = params.get("cwd", [""])[0].strip()
             group_by = params.get("group_by", ["day"])[0].strip().lower()
             user = scoped_user(identity, params.get("user", [""])[0])
             self.send_json({"ok": True, **summary(
                 frm, to, agent=agent or None, upstream=upstream or None,
-                model=model or None, group_by=group_by, user=user,
+                model=model or None, group_by=group_by, user=user, cwd=cwd or None,
             )})
+        elif path == "/api/records":
+            identity = token_info or share_info
+            if not identity:
+                self.send_json({"ok": False, "error": "未登录"}, status=401)
+                return
+            frm, to = parse_range(params)
+            try:
+                limit = max(1, min(int(params.get("limit", ["100"])[0]), 500))
+                offset = max(0, int(params.get("offset", ["0"])[0]))
+            except ValueError:
+                self.send_json({"ok": False, "error": "limit 和 offset 必须为整数"}, status=400)
+                return
+            filters, values = ["ts >= ?", "ts < ?"], [frm, (datetime.strptime(to, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")]
+            for column in ("agent", "upstream", "model", "cwd"):
+                value = params.get(column, [""])[0].strip()
+                if value:
+                    filters.append(f"{column} = ?")
+                    values.append(value)
+            user = scoped_user(identity, params.get("user", [""])[0])
+            if user:
+                filters.append("user = ?")
+                values.append(user)
+            where = " AND ".join(filters)
+            total = query_db(f"SELECT COUNT(*) AS total FROM usage_records WHERE {where}", tuple(values))[0]["total"]
+            rows = query_db(f"""
+                SELECT id, ts, agent, model, upstream, cwd, input_tokens, output_tokens,
+                       cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens,
+                       cost_usd, user
+                FROM usage_records WHERE {where} ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?
+            """, tuple(values) + (limit, offset))
+            fx = fetch_fx_rate()
+            for row in rows:
+                row["cost_cny"] = round((row.get("cost_usd") or 0) * fx, 2)
+            self.send_json({"ok": True, "total": total, "records": rows})
         elif path == "/api/filters":
             identity = token_info or share_info
             if not identity:
@@ -1280,6 +1327,14 @@ class Handler(BaseHTTPRequestHandler):
             """, query_params)
             agents = sorted({row["agent"] for row in rows if row["agent"]})
             upstreams = sorted({row["upstream"] for row in rows if row["upstream"]})
+            project_where = "WHERE cwd IS NOT NULL AND cwd != ''"
+            project_params = ()
+            if user:
+                project_where += " AND user = ?"
+                project_params = (user,)
+            projects = [r["cwd"] for r in query_db(
+                f"SELECT DISTINCT cwd FROM usage_records {project_where} ORDER BY cwd", project_params
+            )]
             users = []
             if identity.get("role") == "admin":
                 users = [r["user"] for r in query_db(
@@ -1287,7 +1342,7 @@ class Handler(BaseHTTPRequestHandler):
                 )]
             elif identity.get("user"):
                 users = [identity["user"]]
-            self.send_json({"ok": True, "agents": agents, "upstreams": upstreams, "users": users})
+            self.send_json({"ok": True, "agents": agents, "upstreams": upstreams, "projects": projects, "users": users})
         elif path == "/api/config":
             token = self.headers.get("X-Token", "")
             if not check_token(token):

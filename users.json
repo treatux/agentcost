@@ -1,6 +1,7 @@
 {
   "agentcost": {
-    "password_hash": "dbaca0a30eb77af83f79d57bf510b7bf9a60966d8a940f51f1ec00244b1f4797",
+    "password_hash": "9fafa091219046a84986d738e6ccfcda4bbb795b4b3675030d3effab241eed83",
+    "salt": "ae2db47415e1ac7634e6f3bff45eceb3",
     "role": "admin"
   }
 }
