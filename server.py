@@ -674,6 +674,14 @@ def summary(frm, to, agent=None, upstream=None, model=None, group_by="day", user
                SUM(reasoning_tokens) as reasoning_tokens
         FROM usage_records WHERE {range_cond} GROUP BY agent
     """, range_params)
+    by_user = query_db(f"""
+        SELECT user, COUNT(*) as cnt, SUM(total_tokens) as tokens, SUM(cost_usd) as cost,
+               SUM(input_tokens) as inp_tokens, SUM(output_tokens) as out_tokens,
+               SUM(cache_read_tokens) as cr_tokens, SUM(cache_write_tokens) as cw_tokens,
+               SUM(reasoning_tokens) as reasoning_tokens
+        FROM usage_records WHERE {range_cond} AND user IS NOT NULL AND user != ''
+        GROUP BY user ORDER BY tokens DESC
+    """, range_params)
     by_model = query_db(f"""
         SELECT model, upstream, billing_mode, price_in, price_out,
                COUNT(*) as cnt, SUM(total_tokens) as tokens, SUM(cost_usd) as cost,
@@ -730,6 +738,7 @@ def summary(frm, to, agent=None, upstream=None, model=None, group_by="day", user
         "fx": fx,
         "total": with_cny(total, ("cost", "saved_usd")),
         "by_agent": [with_cny(a) for a in by_agent],
+        "by_user": [with_cny(u) for u in by_user],
         "by_model": [with_cny(m, ("cost", "saved_usd")) for m in by_model],
         "daily": [with_cny(x) for x in daily],
         "forecast_monthly": forecast_monthly,

@@ -2,5 +2,13 @@
   "agentcost": {
     "password_hash": "dbaca0a30eb77af83f79d57bf510b7bf9a60966d8a940f51f1ec00244b1f4797",
     "role": "admin"
+  },
+  "alice": {
+    "password_hash": "4e40e8ffe0ee32fa53e139147ed559229a5930f89c2204706fc174beb36210b3",
+    "role": "user"
+  },
+  "bob": {
+    "password_hash": "8d059c3640b97180dd2ee453e20d34ab0cb0f2eccbe87d01915a8e578a202b11",
+    "role": "user"
   }
 }
