@@ -352,6 +352,36 @@ def summary(frm, to):
 
     total = agg(base_cond, base_params)
     total["saved_usd"] = 0
+
+    # 月底预测：本月已用成本 / 已过天数 × 本月总天数（金额均为 USD）。
+    now = datetime.now()
+    month_start_dt = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    next_month_dt = (month_start_dt.replace(day=28) + timedelta(days=4)).replace(day=1)
+    month_start = month_start_dt.strftime("%Y-%m-%d")
+    # 截止今天（含今天），避免未来日期记录影响“已用”。
+    today_exclusive = (now.date() + timedelta(days=1)).strftime("%Y-%m-%d")
+    month_used = agg("ts >= ? AND ts < ?", (month_start, today_exclusive))["cost"] or 0
+    days_elapsed = now.day
+    days_total = (next_month_dt - month_start_dt).days
+    month_avg = month_used / days_elapsed if days_elapsed else 0
+    forecast_monthly = {
+        "used": round(month_used, 8),
+        "avg": round(month_avg, 8),
+        "forecast": round(month_avg * days_total, 8),
+        "days_elapsed": days_elapsed,
+        "days_total": days_total,
+    }
+
+    # 环比：将所选范围整体向前平移同样的天数。
+    frm_dt = datetime.strptime(frm, "%Y-%m-%d")
+    to_dt = datetime.strptime(to, "%Y-%m-%d")
+    range_days = (to_dt - frm_dt).days + 1
+    prev_from_dt = frm_dt - timedelta(days=range_days)
+    prev_to_dt = to_dt - timedelta(days=range_days)
+    prev_from = prev_from_dt.strftime("%Y-%m-%d")
+    prev_to = prev_to_dt.strftime("%Y-%m-%d")
+    prev = agg("ts >= ? AND ts < ?", (prev_from, (prev_to_dt + timedelta(days=1)).strftime("%Y-%m-%d")))
+    prev.update({"from": prev_from, "to": prev_to})
     by_agent = query_db(f"""
         SELECT agent, COUNT(*) as cnt, SUM(total_tokens) as tokens, SUM(cost_usd) as cost
         FROM usage_records WHERE {base_cond} GROUP BY agent
@@ -388,6 +418,8 @@ def summary(frm, to):
         "by_agent": [with_cny(a) for a in by_agent],
         "by_model": [with_cny(m, ("cost", "saved_usd")) for m in by_model],
         "daily": [with_cny(x) for x in daily],
+        "forecast_monthly": forecast_monthly,
+        "prev": prev,
     }
 
 

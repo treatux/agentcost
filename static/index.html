@@ -59,6 +59,12 @@
   .card .label { color: var(--muted); font-size: 12px; margin-bottom: 10px; letter-spacing: 0.3px; }
   .card .value { font-size: 26px; font-weight: 650; letter-spacing: -0.5px; }
   .card .value small { font-size: 13px; color: var(--muted); font-weight: 400; margin-left: 6px; }
+  .budget-panel { margin-top: -20px; }
+  .budget-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 10px; }
+  .budget-head h2 { margin-bottom: 0; }
+  .budget-text { color: var(--muted); font-size: 13px; }
+  .budget-track { height: 10px; background: var(--chip); border-radius: 999px; overflow: hidden; }
+  .budget-track i { display: block; height: 100%; border-radius: inherit; background: #4a9d6a; transition: width .25s; }
 
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
   /* ===== 移动端适配 ===== */
@@ -453,13 +459,28 @@ function renderToolbar() {
 function render(el, d) {
   const t = d.total;
   const days = Math.max(1, Math.round((new Date(d.range.to) - new Date(d.range.from)) / 86400000) + 1);
+  const forecast = d.forecast_monthly || {};
+  const prev = d.prev || {};
+  const prevPct = prev.cost ? ((t.cost - prev.cost) / prev.cost * 100) : null;
+  const prevColor = prevPct > 0 ? '#d97757' : '#4a9d6a';
   const cards = [
     { label: 'TOKENS 总量', value: fmtTokens(t.tokens), sub: fmtCost(t.cost) },
     { label: '估算成本', value: fmtCost(t.cost), sub: t.cnt + ' 条记录' },
     { label: '缓存节省', value: t.saved_usd ? fmtCost(t.saved_usd) : '—', sub: '省下的钱' },
     { label: '日均', value: fmtTokens(t.tokens / days), sub: fmtCost(t.cost / days) + ' / 天' },
+    { label: '月底预测', value: forecast.used ? fmtCost(forecast.forecast) : '—', sub: forecast.used ? `已用 ${forecast.days_elapsed} 天 · 日均 ${fmtCost(forecast.avg)}` : '—' },
+    { label: '环比', value: prevPct == null ? '—' : `<span style="color:${prevColor}">${prevPct >= 0 ? '+' : ''}${prevPct.toFixed(1)}%</span>`, sub: 'vs 上一段' },
     { label: '所选范围', value: d.range.from.slice(5), sub: '至 ' + d.range.to.slice(5) + ' · ' + days + ' 天' },
   ];
+  const budget = state.budget || {};
+  const budgetAmount = Number(budget.monthly_budget);
+  const budgetCurrency = budget.budget_currency || 'cny';
+  const usedCur = (forecast.used || 0) * (getCurrency() === 'cny' ? (state.fx || 7.1) : 1);
+  const budgetUsd = budgetCurrency === 'cny' ? budgetAmount / (state.fx || 7.1) : budgetAmount;
+  const budgetCur = budgetUsd * (getCurrency() === 'cny' ? (state.fx || 7.1) : 1);
+  const budgetPct = budgetCur > 0 ? usedCur / budgetCur * 100 : 0;
+  const budgetColor = budgetPct > 100 ? '#c0392b' : budgetPct >= 80 ? '#d97757' : '#4a9d6a';
+  const budgetHtml = Number.isFinite(budgetAmount) ? `<div class="panel budget-panel"><div class="budget-head"><h2>本月预算</h2><span class="budget-text">已用 ${fmtCost(forecast.used || 0)} / 预算 ${getCurrency() === 'cny' ? '¥' : '$'}${budgetCur.toFixed(getCurrency() === 'cny' ? 0 : 2)} (${budgetPct.toFixed(1)}%)</span></div><div class="budget-track"><i style="width:${Math.min(budgetPct, 100)}%;background:${budgetColor}"></i></div></div>` : '';
   const agentTags = { codex: 'codex', hermes: 'hermes', claude: 'claude' };
   const byAgentHtml = d.by_agent.map(a => `
     <tr><td><span class="tag tag-${agentTags[a.agent] || 'codex'}">${a.agent}</span></td>
@@ -508,6 +529,7 @@ function render(el, d) {
       </header>
       ${renderToolbar()}
       <div class="cards">${cards.map(c => `<div class="card"><div class="label">${c.label}</div><div class="value">${c.value}<small>${c.sub}</small></div></div>`).join('')}</div>
+      ${budgetHtml}
       <div class="panel" id="barPanel"><h2>模型对比 (Top 10)</h2>${chartTabs('barTabs', 'tokens')}<div class="chart-note">悬停柱子查看详情</div>${barChart}</div>
       <div class="panel" id="donutPanel"><h2>成本分布</h2>${chartTabs('donutTabs', 'cost')}<div class="chart-note">按模型占比</div>${donutChart}</div>
       <div class="grid2">
@@ -568,9 +590,10 @@ async function load() {
     const q = new URLSearchParams();
     if (state.from) q.set('from', state.from);
     if (state.to) q.set('to', state.to);
-    const d = await api('api/summary?' + q.toString());
+    const [d, cfgResp] = await Promise.all([api('api/summary?' + q.toString()), api('api/config')]);
     if (!d.ok) throw new Error(d.error || '加载失败');
     state.fx = d.fx || state.fx;
+    state.budget = (cfgResp && cfgResp.config) || state.budget || {};
     render(el, d);
   } catch (e) { if (e.message !== '未登录') el.innerHTML = '<div class="err-msg">加载失败: ' + e.message + '</div>'; }
 }
