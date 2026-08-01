@@ -317,7 +317,9 @@ def summary(frm, to):
         """给金额对象附加人民币字段。"""
         for k in keys:
             v = obj.get(k) or 0
-            obj[k + "_cny"] = round(v * fx, 2)
+            # saved_usd 的人民币字段按 API 约定命名为 saved_cny。
+            out_key = "saved_cny" if k == "saved_usd" else k + "_cny"
+            obj[out_key] = round(v * fx, 2)
         return obj
 
     def with_cache(m):
@@ -348,6 +350,7 @@ def summary(frm, to):
         return m
 
     total = agg(base_cond, base_params)
+    total["saved_usd"] = 0
     by_agent = query_db(f"""
         SELECT agent, COUNT(*) as cnt, SUM(total_tokens) as tokens, SUM(cost_usd) as cost
         FROM usage_records WHERE {base_cond} GROUP BY agent
@@ -357,19 +360,32 @@ def summary(frm, to):
                COUNT(*) as cnt, SUM(total_tokens) as tokens, SUM(cost_usd) as cost,
                SUM(input_tokens) as inp_tokens, SUM(output_tokens) as out_tokens,
                SUM(cache_read_tokens) as cr_tokens, SUM(cache_write_tokens) as cw_tokens
-        FROM usage_records WHERE {base_cond} GROUP BY model, upstream ORDER BY tokens DESC LIMIT 20
+        FROM usage_records WHERE {base_cond} GROUP BY model, upstream ORDER BY tokens DESC
     """, base_params)
     daily = query_db(f"""
         SELECT substr(ts,1,10) as day, COUNT(*) as cnt, SUM(total_tokens) as tokens, SUM(cost_usd) as cost
         FROM usage_records WHERE {base_cond} GROUP BY day ORDER BY day
     """, base_params)
 
+    # 缓存节省：若无缓存，缓存读 token 按输入价计费；实际按缓存读价计费。
+    for m in by_model:
+        with_cache(m)
+        cr = m.get("cr_tokens") or 0
+        price_in = m.get("price_in")
+        cache_price_in = m.get("cache_price_in")
+        if cr and price_in is not None and cache_price_in is not None:
+            m["saved_usd"] = cr / 1e6 * (float(price_in) - float(cache_price_in))
+        else:
+            m["saved_usd"] = 0
+        total["saved_usd"] += m["saved_usd"]
+    total["saved_usd"] = round(total["saved_usd"], 8)
+
     return {
         "range": {"from": frm, "to": to},
         "fx": fx,
-        "total": with_cny(total),
+        "total": with_cny(total, ("cost", "saved_usd")),
         "by_agent": [with_cny(a) for a in by_agent],
-        "by_model": [with_cny(with_cache(m)) for m in by_model],
+        "by_model": [with_cny(m, ("cost", "saved_usd")) for m in by_model],
         "daily": [with_cny(x) for x in daily],
     }
 

@@ -54,7 +54,7 @@
   .cur-select { background: var(--card); border: 1px solid var(--line); color: var(--text); border-radius: 8px; padding: 7px 12px; font-size: 13px; cursor: pointer; outline: none; }
   .cur-select:hover { border-color: var(--accent); }
 
-  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin-bottom: 36px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin-bottom: 36px; }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 22px 20px; }
   .card .label { color: var(--muted); font-size: 12px; margin-bottom: 10px; letter-spacing: 0.3px; }
   .card .value { font-size: 26px; font-weight: 650; letter-spacing: -0.5px; }
@@ -335,6 +335,30 @@ function svgBarChart(models, dim = 'tokens') {
   </svg></div>`;
 }
 
+function svgDonutChart(items, dim = 'cost') {
+  if (!items || items.length === 0) return '<div class="muted" style="padding:30px 0;text-align:center">范围内无数据</div>';
+  const W = 1000, H = 320, cx = 500, cy = 160, r = 90, sw = 30;
+  const key = dim === 'cnt' ? 'cnt' : dim === 'tokens' ? 'tokens' : 'cost';
+  const vals = items.map(x => Math.max(0, Number(x[key]) || 0));
+  const total = vals.reduce((a, b) => a + b, 0);
+  if (!total) return '<div class="muted" style="padding:30px 0;text-align:center">范围内无数据</div>';
+  const colors = ['#d97757','#e8a08a','#c05f3f','#f0c4a8','#9a6b3f','#d49a72','#b96d52','#efb99f','#a85b42','#e2b18f'];
+  const circ = 2 * Math.PI * r;
+  let offset = 0, segs = '', legend = '';
+  vals.forEach((v, i) => {
+    if (!v) return;
+    const len = v / total * circ;
+    const label = items[i].label || items[i].model || '—';
+    const valTxt = dim === 'cnt' ? v + ' 次' : dim === 'tokens' ? fmtTokens(v) : fmtCost(v);
+    const tip = `<div class="tip-t">${label}</div><div>${dim === 'cnt' ? '请求数' : dim === 'tokens' ? 'Tokens' : '成本'}: <span class="tip-v">${valTxt}</span></div>`;
+    segs += `<circle class="hoverable" data-tip="${tip.replace(/"/g, '&quot;')}" cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${colors[i % colors.length]}" stroke-width="${sw}" stroke-dasharray="${len} ${circ-len}" stroke-dashoffset="${-offset}" transform="rotate(-90 ${cx} ${cy})"/>`;
+    offset += len;
+    legend += `<text x="650" y="${78 + i * 22}" font-size="12" fill="#6f6f69"><tspan fill="${colors[i % colors.length]}">●</tspan> ${label.slice(0, 24)} · ${Math.round(v / total * 100)}%</text>`;
+  });
+  const center = dim === 'cnt' ? String(Math.round(total)) : dim === 'tokens' ? fmtTokens(total) : fmtCostAxis(total);
+  return `<div class="chart-box"><svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto" role="img"><circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#eeeae2" stroke-width="${sw}"/>${segs}<text x="${cx}" y="${cy - 2}" text-anchor="middle" font-size="24" font-weight="600" fill="#3d3d39">${center}</text><text x="${cx}" y="${cy + 20}" text-anchor="middle" font-size="12" fill="#8a8a85">${dim === 'cnt' ? '请求数' : dim === 'tokens' ? 'Tokens' : '成本'}</text>${legend}</svg></div>`;
+}
+
 /* 图表维度切换 tabs */
 function chartTabs(id, active) {
   const items = [['tokens', 'Tokens'], ['cnt', '请求数'], ['cost', '成本']];
@@ -351,7 +375,8 @@ function bindChartTabs() {
         tabs.querySelectorAll('button').forEach(b => b.classList.toggle('on', b === btn));
         const chartBox = container.querySelector('.chart-box');
         const isBar = container.id === 'barPanel';
-        const newHtml = isBar ? svgBarChart(window.__barData || [], dim) : svgLineChart(window.__lineData || [], dim);
+        const isDonut = container.id === 'donutPanel';
+        const newHtml = isBar ? svgBarChart(window.__barData || [], dim) : isDonut ? svgDonutChart(window.__donutData || [], dim) : svgLineChart(window.__lineData || [], dim);
         // 提取纯 svg 替换，避免 chart-box 嵌套
         const m = newHtml.match(/<svg[\s\S]*<\/svg>/);
         if (m && chartBox) chartBox.innerHTML = m[0];
@@ -431,6 +456,7 @@ function render(el, d) {
   const cards = [
     { label: 'TOKENS 总量', value: fmtTokens(t.tokens), sub: fmtCost(t.cost) },
     { label: '估算成本', value: fmtCost(t.cost), sub: t.cnt + ' 条记录' },
+    { label: '缓存节省', value: t.saved_usd ? fmtCost(t.saved_usd) : '—', sub: '省下的钱' },
     { label: '日均', value: fmtTokens(t.tokens / days), sub: fmtCost(t.cost / days) + ' / 天' },
     { label: '所选范围', value: d.range.from.slice(5), sub: '至 ' + d.range.to.slice(5) + ' · ' + days + ' 天' },
   ];
@@ -448,7 +474,7 @@ function render(el, d) {
     if (m.cache_price_in != null) {
       cachePriceTxt = fmtPrice(m.cache_price_in) + (getCurrency() === 'cny' ? '/' + fmtPrice(m.cache_price_write) : '/' + fmtPrice(m.cache_price_write));
     }
-    const tip = `<div class="tip-t">${m.model}</div><div>上游: ${m.upstream || '—'} · ${m.billing_mode === 'coding_plan' ? 'Coding Plan' : 'API'}</div><div>新输入: <span class="tip-v">${fmtTokens(m.cache_inp_tokens)}</span></div><div>缓存读: <span class="tip-v">${fmtTokens(m.cache_cr_tokens)}</span> (${cachePct}%)</div><div>缓存写: ${fmtTokens(m.cache_cw_tokens)}</div><div>输出: ${fmtTokens(m.out_tokens)}</div><div>成本: <span class="tip-v">${fmtCost(m.cost)}</span></div>`;
+    const tip = `<div class="tip-t">${m.model}</div><div>上游: ${m.upstream || '—'} · ${m.billing_mode === 'coding_plan' ? 'Coding Plan' : 'API'}</div><div>新输入: <span class="tip-v">${fmtTokens(m.cache_inp_tokens)}</span></div><div>缓存读: <span class="tip-v">${fmtTokens(m.cache_cr_tokens)}</span> (${cachePct}%)</div><div>缓存写: ${fmtTokens(m.cache_cw_tokens)}</div><div>输出: ${fmtTokens(m.out_tokens)}</div><div>成本: <span class="tip-v">${fmtCost(m.cost)}</span></div><div>缓存节省: <span class="tip-v">${fmtCost(m.saved_usd)}</span></div>`;
     return `<tr>
       <td style="width:22%">${m.model || 'unknown'}</td>
       <td style="width:10%"><span class="tag tag-up">${upstreamNames[m.upstream] || m.upstream || '—'}</span></td>
@@ -458,7 +484,7 @@ function render(el, d) {
         <div class="cache-price muted" title="缓存读价/缓存写价">${cachePriceTxt}</div></td>
       <td style="width:18%"><div class="bar"><i style="width:${pct(m.tokens, maxModel).toFixed(1)}%"></i></div></td>
       <td class="num" style="width:8%">${fmtTokens(m.tokens)}</td>
-      <td class="num" style="width:7%">${fmtCost(m.cost)}</td></tr>`;
+      <td class="num" style="width:7%">${fmtCost(m.cost)}</td><td class="num" style="width:9%">${fmtCost(m.saved_usd)}</td></tr>`;
   }).join('');
   const maxDay = Math.max(...d.daily.map(x => x.tokens), 1);
   const dailyHtml = d.daily.map(x => `
@@ -468,9 +494,11 @@ function render(el, d) {
 
   // ---- SVG 图表 ----
   window.__barData = d.by_model.slice(0, 10);
+  window.__donutData = d.by_model.map(m => ({label: m.model || 'unknown', cost: m.cost || 0, tokens: m.tokens || 0, cnt: m.cnt || 0}));
   window.__lineData = d.daily;
   const lineChart = svgLineChart(d.daily, 'tokens');
   const barChart = svgBarChart(d.by_model.slice(0, 10), 'tokens');
+  const donutChart = svgDonutChart(window.__donutData, 'cost');
 
   el.innerHTML = `
     <div class="wrap">
@@ -481,9 +509,10 @@ function render(el, d) {
       ${renderToolbar()}
       <div class="cards">${cards.map(c => `<div class="card"><div class="label">${c.label}</div><div class="value">${c.value}<small>${c.sub}</small></div></div>`).join('')}</div>
       <div class="panel" id="barPanel"><h2>模型对比 (Top 10)</h2>${chartTabs('barTabs', 'tokens')}<div class="chart-note">悬停柱子查看详情</div>${barChart}</div>
+      <div class="panel" id="donutPanel"><h2>成本分布</h2>${chartTabs('donutTabs', 'cost')}<div class="chart-note">按模型占比</div>${donutChart}</div>
       <div class="grid2">
         <div class="panel"><h2>按 Agent</h2><div class="scroll-box"><table><tr><th>来源</th><th>Tokens</th><th>成本</th></tr>${byAgentHtml}</table></div></div>
-        <div class="panel"><h2>按模型</h2><div class="scroll-box"><table><tr><th>模型</th><th>上游</th><th>计费</th><th>价格(入/出)</th><th>缓存率·价</th><th></th><th>Tokens</th><th>成本</th></tr>${byModelHtml}</table></div></div>
+        <div class="panel"><h2>按模型</h2><div class="scroll-box"><table><tr><th>模型</th><th>上游</th><th>计费</th><th>价格(入/出)</th><th>缓存率·价</th><th></th><th>Tokens</th><th>成本</th><th>缓存节省</th></tr>${byModelHtml}</table></div></div>
       </div>
       <div class="panel" id="linePanel"><h2>每日趋势</h2>${chartTabs('lineTabs', 'tokens')}<div class="chart-note">悬停数据点查看详情</div>${lineChart}<table><tr><th>日期</th><th></th><th>Tokens</th><th>成本</th></tr>${dailyHtml || '<tr><td colspan="4" class="muted">范围内无数据</td></tr>'}</table></div>
     </div>`;
