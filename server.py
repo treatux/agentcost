@@ -24,6 +24,7 @@ from urllib.parse import urlparse, parse_qs
 
 __version__ = "1.3.0"
 START_TIME = time.time()
+LAST_SCAN_AT = None
 
 DB_DIR = os.environ.get("AGENTCOST_DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(DB_DIR, "agentcost.db")
@@ -37,12 +38,16 @@ AUTO_REFRESH_SECONDS = int(os.environ.get("AGENTCOST_REFRESH_SECONDS", "300"))  
 
 # ---- 自动刷新：定时重跑 parser 更新 DB ----
 def run_parser():
+    global LAST_SCAN_AT
     try:
         result = subprocess.run(
             [sys.executable, PARSER_PATH],
             capture_output=True, text=True, timeout=180
         )
-        return result.returncode == 0
+        if result.returncode == 0:
+            LAST_SCAN_AT = datetime.now().astimezone().isoformat()
+            return True
+        return False
     except Exception:
         return False
 
@@ -440,6 +445,7 @@ def summary(frm, to, agent=None, upstream=None):
     total["saved_usd"] = round(total["saved_usd"], 8)
 
     return {
+        "last_scan": LAST_SCAN_AT,
         "range": {"from": frm, "to": to},
         "fx": fx,
         "total": with_cny(total, ("cost", "saved_usd")),
@@ -702,6 +708,7 @@ class Handler(BaseHTTPRequestHandler):
                 "db_ok": db_ok,
                 "records": records,
                 "uptime_seconds": int(time.time() - START_TIME),
+                "last_scan": LAST_SCAN_AT,
             })
         elif path == "/api/summary":
             token = self.headers.get("X-Token", "")

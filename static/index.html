@@ -188,6 +188,7 @@
 const TOKEN_KEY = 'agentcost_token';
 const CURRENCY_KEY = 'agentcost_currency';
 let state = { from: '', to: '', fx: 7.1, agent: '', upstream: '', filters: { agents: [], upstreams: [] } };
+let lastScanAt = null;
 
 function getCurrency() { return localStorage.getItem(CURRENCY_KEY) || 'cny'; }
 function setCurrency(c) { localStorage.setItem(CURRENCY_KEY, c); }
@@ -460,6 +461,17 @@ function bindChartTabs() {
 function todayStr() { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); }
 function daysAgo(n) { const d = new Date(); d.setDate(d.getDate() - n); return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); }
 function monthStart() { return todayStr().slice(0, 8) + '01'; }
+function lastScanText() {
+  if (!lastScanAt) return '最后更新: 暂无';
+  const ms = Date.now() - new Date(lastScanAt).getTime();
+  const mins = Math.max(0, Math.floor(ms / 60000));
+  return '最后更新: ' + (mins < 1 ? '刚刚' : mins + '分钟前');
+}
+function updateLastScan() {
+  const el = document.getElementById('lastScan');
+  if (el) el.textContent = lastScanText();
+}
+setInterval(updateLastScan, 60000);
 
 async function api(url, opts = {}) {
   const token = localStorage.getItem(TOKEN_KEY);
@@ -531,6 +543,7 @@ function renderToolbar() {
 }
 
 function render(el, d) {
+  lastScanAt = d.last_scan || null;
   const t = d.total;
   const days = Math.max(1, Math.round((new Date(d.range.to) - new Date(d.range.from)) / 86400000) + 1);
   const forecast = d.forecast_monthly || {};
@@ -600,7 +613,7 @@ function render(el, d) {
     <div class="wrap">
       <header>
         <h1>Agent<em>Cost</em></h1>
-        <div class="head-sub">AI Agent 用量与成本</div>
+        <div class="head-sub">AI Agent 用量与成本 · <span id="lastScan">${lastScanText()}</span></div>
       </header>
       ${renderToolbar()}
       <div class="cards">${cards.map(c => `<div class="card"><div class="label">${c.label}</div><div class="value">${c.value}<small>${c.sub}</small></div></div>`).join('')}</div>
@@ -617,6 +630,7 @@ function render(el, d) {
   bindToolbar();
   bindChartHover();
   bindChartTabs();
+  updateLastScan();
 }
 
 function bindToolbar() {

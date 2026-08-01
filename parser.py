@@ -9,7 +9,7 @@ import glob
 import os
 import re
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 # ---- 可配置路径（Docker 部署通过环境变量覆盖）----
@@ -109,7 +109,7 @@ def resolve_upstream(provider, base_url="", model=""):
     if model:
         ovr = get_override(model)
         if ovr and ovr.get("upstream"):
-            return ovr["upstream"]
+            return str(ovr["upstream"]).lower()
     p = (provider or "").lower()
     b = (base_url or "").lower()
     if "wanlai" in p or "wanlai" in b:
@@ -127,7 +127,7 @@ def resolve_upstream(provider, base_url="", model=""):
     if "openai" in p or "openai" in b:
         return "openai"
     if p and p not in ("", "auto", "custom"):
-        return p
+        return p.lower()
     return "custom"
 
 
@@ -239,8 +239,10 @@ def parse_claude_session(path):
     return records
 
 
-def estimate_cost(model, usage, upstream="custom"):
+def estimate_cost(model, usage, upstream="custom", billing_mode="api"):
     """根据上游价格估算美元成本。"""
+    if billing_mode == "coding_plan":
+        return 0
     price_in, price_out = get_model_price(model, upstream)
     if price_in is None or price_out is None:
         return None
@@ -320,9 +322,13 @@ def scan_all():
 
     # 计算成本（Hermes 自带成本则保留）
     for r in all_records:
-        if r.get("cost_usd") is None or r.get("cost_usd") == 0:
-            r["cost_usd"] = estimate_cost(r.get("model"), r.get("usage") or {}, r.get("upstream", "custom"))
         r["billing_mode"] = get_billing_mode(r.get("model"), r.get("provider"), r.get("upstream"))
+        if r["billing_mode"] == "coding_plan":
+            r["cost_usd"] = 0
+        elif r.get("cost_usd") is None or r.get("cost_usd") == 0:
+            r["cost_usd"] = estimate_cost(
+                r.get("model"), r.get("usage") or {}, r.get("upstream", "custom"), r["billing_mode"]
+            )
         r["price_in"], r["price_out"] = get_model_price(r.get("model"), r.get("upstream"))
         r["total_tokens"] = (
             (r.get("usage") or {}).get("input_tokens", 0)
@@ -381,11 +387,14 @@ def build_db(records, db_path):
             source TEXT DEFAULT 'parser'
         )
     """)
-    # 兼容旧库：为已有表补充来源列；仅清理解析器写入的数据，保留 API 接入记录。
+    # 兼容旧库：为已有表补充来源列；归一化历史上游名称并仅清理保留窗口外的解析器数据。
     cols = {row[1] for row in cur.execute("PRAGMA table_info(usage_records)").fetchall()}
     if "source" not in cols:
         cur.execute("ALTER TABLE usage_records ADD COLUMN source TEXT DEFAULT 'parser'")
-    cur.execute("DELETE FROM usage_records WHERE source = 'parser' OR source IS NULL")
+    cur.execute("UPDATE usage_records SET upstream = lower(upstream) WHERE upstream IS NOT NULL")
+    retention_days = int(os.environ.get("AGENTCOST_RETENTION_DAYS", "180"))
+    cutoff = (datetime.now() - timedelta(days=retention_days)).strftime("%Y-%m-%d %H:%M:%S")
+    cur.execute("DELETE FROM usage_records WHERE source = 'parser' AND ts < ?", (cutoff,))
     for r in records:
         u = r.get("usage") or {}
         cur.execute("""
