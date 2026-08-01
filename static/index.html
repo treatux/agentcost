@@ -209,6 +209,12 @@ function fmtCost(n, isPrice = false) {
 function fmtPrice(p) { return fmtCost(p, true); }
 /* Y 轴刻度：整数显示整数，小数保留两位 */
 function fmtAxis(n) { return Math.round(n) === n ? String(Math.round(n)) : n.toFixed(2); }
+/* 成本轴：按当前货币换算（DB 存 USD）后格式化，不带符号 */
+function fmtCostAxis(n) {
+  const cur = getCurrency();
+  const v = cur === 'usd' ? n : n * (state.fx || 7.1);
+  return fmtAxis(v);
+}
 function pct(n, total) { return total ? (n / total * 100) : 0; }
 
 /* ---------- SVG 图表（带 hover） ---------- */
@@ -272,7 +278,7 @@ function svgLineChart(daily, dim = 'tokens') {
   for (let g = 0; g <= 4; g++) {
     const y = PT + ih - (g / 4) * ih;
     const val = max * g / 4;
-    const valTxt = dim === 'cnt' ? val + '' : dim === 'cost' ? fmtAxis(val) : fmtTokens(val);
+    const valTxt = dim === 'cnt' ? val + '' : dim === 'cost' ? fmtCostAxis(val) : fmtTokens(val);
     grid += `<line x1="${PL}" y1="${y}" x2="${W - PR}" y2="${y}" stroke="#e4e2db" stroke-width="1"/>`;
     grid += `<text x="${PL - 8}" y="${y + 3}" text-anchor="end" font-size="11" fill="#8a8a85">${valTxt}</text>`;
   }
@@ -308,7 +314,7 @@ function svgBarChart(models, dim = 'tokens') {
     const valTxt = dim === 'cnt' ? v + ' 次' : dim === 'cost' ? fmtCost(v) : fmtTokens(v);
     const tip = `<div class="tip-t">${models[i].model}</div><div>上游: ${models[i].upstream || '—'}</div><div>${dim === 'cnt' ? '请求数' : dim === 'cost' ? '成本' : 'Tokens'}: <span class="tip-v">${valTxt}</span></div>`;
     bars += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" rx="4" fill="#d97757" opacity=".85"/>`;
-    bars += `<text x="${(x + barW / 2).toFixed(1)}" y="${(y - 6).toFixed(1)}" text-anchor="middle" font-size="11" fill="#8a8a85" font-weight="600">${dim === 'cnt' ? v : dim === 'cost' ? fmtAxis(v) : fmtTokens(v)}</text>`;
+    bars += `<text x="${(x + barW / 2).toFixed(1)}" y="${(y - 6).toFixed(1)}" text-anchor="middle" font-size="11" fill="#8a8a85" font-weight="600">${dim === 'cnt' ? v : dim === 'cost' ? fmtCostAxis(v) : fmtTokens(v)}</text>`;
     bars += `<rect class="hoverable" data-tip="${tip.replace(/"/g, '&quot;')}" x="${x.toFixed(1)}" y="${PT}" width="${barW.toFixed(1)}" height="${ih.toFixed(1)}" fill="transparent" style="pointer-events:all"/>`;
     labels += `<text x="${(x + barW / 2).toFixed(1)}" y="${H - 28}" text-anchor="middle" font-size="10" fill="#8a8a85">${short}</text>`;
     labels += `<text x="${(x + barW / 2).toFixed(1)}" y="${H - 12}" text-anchor="middle" font-size="9.5" fill="#c9cede">${models[i].upstream || ''}</text>`;
@@ -319,7 +325,7 @@ function svgBarChart(models, dim = 'tokens') {
     const y = PT + ih - (g / 4) * ih;
     const val = max * g / 4;
     grid += `<line x1="${PL}" y1="${y}" x2="${W - PR}" y2="${y}" stroke="#e4e2db" stroke-width="1"/>`;
-    grid += `<text x="${PL - 8}" y="${y + 3}" text-anchor="end" font-size="11" fill="#8a8a85">${dim === 'cnt' ? val : dim === 'cost' ? fmtAxis(val) : fmtTokens(val)}</text>`;
+    grid += `<text x="${PL - 8}" y="${y + 3}" text-anchor="end" font-size="11" fill="#8a8a85">${dim === 'cnt' ? val : dim === 'cost' ? fmtCostAxis(val) : fmtTokens(val)}</text>`;
   }
 
   return `<div class="chart-box"><svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto" role="img">
