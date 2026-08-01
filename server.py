@@ -293,9 +293,9 @@ def query_db(sql, params=()):
 
 
 def parse_range(params):
-    """解析 from/to 参数，返回 (from_str, to_str)。默认本月。"""
+    """解析 from/to 参数，返回 (from_str, to_str)。默认近 7 天。"""
     today = datetime.now().strftime("%Y-%m-%d")
-    frm = params.get("from", [""])[0] or datetime.now().strftime("%Y-%m-01")
+    frm = params.get("from", [""])[0] or (datetime.now() - timedelta(days=6)).strftime("%Y-%m-%d")
     to = params.get("to", [""])[0] or today
     return frm, to
 

@@ -436,7 +436,7 @@ function renderToolbar() {
   return `
     <div class="toolbar">
       <label>从</label>
-      <input type="date" id="from" value="${state.from || monthStart()}">
+      <input type="date" id="from" value="${state.from || daysAgo(6)}">
       <label>到</label>
       <input type="date" id="to" value="${state.to || todayStr()}">
       <div class="quick">
