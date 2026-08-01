@@ -61,10 +61,15 @@ DEFAULT_CONFIG = {
     "webhook_type": "generic",   # wecom / serverchan / dingtalk / generic
     "webhook_url": "",
     "notify_cooldown_hours": 12, # 同一告警等级 12 小时内不重复通知
+    "report_enabled": False,
+    "report_time": "09:00",     # 每日推送时间（24 小时制）
+    "report_weekday": 1,          # 周报推送日：1=周一 ... 7=周日，0=每天
+    "report_type": "daily",     # daily / weekly
     "ingest_key": "",             # 独立数据接入密钥；为空时仅允许登录 token
 }
 _config = dict(DEFAULT_CONFIG)
 _last_notify = {}  # level -> timestamp
+_last_report_date = None  # YYYY-MM-DD，仅在当前进程内防止同日重复推送
 
 
 def load_config():
@@ -221,6 +226,118 @@ def check_budget_and_notify():
         print(f"[budget] 检查失败: {e}")
 
 
+def _format_report_money(data, key="cost"):
+    """按预算货币格式化汇总中的金额。"""
+    usd_key = "saved_usd" if key == "saved" else key
+    cny_key = "saved_cny" if key == "saved" else key + "_cny"
+    if _config.get("budget_currency", "cny") == "cny":
+        return f"¥{(data.get(cny_key) or 0):.2f}"
+    return f"${(data.get(usd_key) or 0):.2f}"
+
+
+def _format_report_tokens(tokens):
+    tokens = tokens or 0
+    if tokens >= 1_000_000:
+        return f"{tokens / 1_000_000:.2f}M"
+    if tokens >= 1_000:
+        return f"{tokens / 1_000:.2f}K"
+    return str(int(tokens))
+
+
+def _report_top_models(data, limit=1):
+    # summary 按 model + upstream 分组；报告中合并同名模型，避免 Top 3 出现重复项。
+    costs = {}
+    for item in data.get("by_model", []):
+        model = item.get("model") or "未知模型"
+        costs[model] = costs.get(model, 0) + (item.get("cost") or 0)
+    return [model for model, _ in sorted(costs.items(), key=lambda item: item[1], reverse=True)[:limit]]
+
+
+def build_report_text(kind):
+    """生成日报或周报文本，供定时 Webhook 推送使用。"""
+    if kind not in ("daily", "weekly"):
+        raise ValueError("报告类型必须是 daily 或 weekly")
+
+    today = datetime.now().date()
+    last_complete_day = today - timedelta(days=1)
+    if kind == "daily":
+        report_day = last_complete_day
+        data = summary(report_day.isoformat(), report_day.isoformat())
+        # 昨天没有数据时，回退到最近一个有记录的已完成日期。
+        if not data["total"].get("cnt"):
+            rows = query_db(
+                "SELECT MAX(substr(ts,1,10)) AS day FROM usage_records WHERE ts < ?",
+                (today.isoformat(),),
+            )
+            if rows and rows[0].get("day"):
+                report_day = datetime.strptime(rows[0]["day"], "%Y-%m-%d").date()
+                data = summary(report_day.isoformat(), report_day.isoformat())
+
+        total = data["total"]
+        top_models = _report_top_models(data)
+        prev_cost = data["prev"].get("cost") or 0
+        cost = total.get("cost") or 0
+        change = "—" if not prev_cost else f"{(cost - prev_cost) / prev_cost * 100:+.1f}%"
+        return "\n".join((
+            f"📊 AgentCost 日报 ({report_day.strftime('%m-%d')})",
+            f"成本: {_format_report_money(total)} | Tokens: {_format_report_tokens(total.get('tokens'))} | 请求: {total.get('cnt') or 0}",
+            f"缓存节省: {_format_report_money(total, 'saved')}",
+            f"Top 模型: {top_models[0] if top_models else '暂无数据'}",
+            f"环比: {change}",
+        ))
+
+    week_to = last_complete_day
+    week_from = week_to - timedelta(days=6)
+    data = summary(week_from.isoformat(), week_to.isoformat())
+    total = data["total"]
+    top_models = _report_top_models(data, 3)
+    average_cost = (total.get("cost") or 0) / 7
+    if _config.get("budget_currency", "cny") == "cny":
+        average_text = f"¥{average_cost * (data.get('fx') or 0):.2f}"
+    else:
+        average_text = f"${average_cost:.2f}"
+    budget = float(_config.get("monthly_budget", 0) or 0)
+    month_used = data["forecast_monthly"].get("used") or 0
+    if _config.get("budget_currency", "cny") == "cny":
+        month_used *= data.get("fx") or 0
+    budget_pct = month_used / budget * 100 if budget > 0 else 0
+    return "\n".join((
+        f"📈 AgentCost 周报 ({week_from.strftime('%m-%d')} ~ {week_to.strftime('%m-%d')})",
+        f"成本: {_format_report_money(total)} | Tokens: {_format_report_tokens(total.get('tokens'))} | 请求: {total.get('cnt') or 0}",
+        f"日均成本: {average_text} | 缓存节省: {_format_report_money(total, 'saved')}",
+        f"预算使用率: {budget_pct:.1f}%",
+        f"Top 模型: {', '.join(top_models) if top_models else '暂无数据'}",
+    ))
+
+
+def check_scheduled_report():
+    """在现有刷新循环中检查并发送当天的日报或周报。"""
+    global _last_report_date
+    cfg = _config
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    if not cfg.get("report_enabled") or _last_report_date == today:
+        return
+    report_time = str(cfg.get("report_time") or "09:00")
+    try:
+        datetime.strptime(report_time, "%H:%M")
+    except ValueError:
+        print(f"[report] 无效推送时间: {report_time}")
+        return
+    if now.strftime("%H:%M") < report_time:
+        return
+    kind = cfg.get("report_type", "daily")
+    if kind == "weekly":
+        weekday = int(cfg.get("report_weekday", 1) or 0)
+        if weekday and now.isoweekday() != weekday:
+            return
+    if kind not in ("daily", "weekly"):
+        print(f"[report] 无效报告类型: {kind}")
+        return
+    _last_report_date = today
+    send_webhook(build_report_text(kind))
+
+
 def auto_refresh_loop():
     """后台线程：启动时刷一次，之后每 5 分钟刷一次；每次刷新后检查预算。"""
     run_parser()
@@ -231,6 +348,7 @@ def auto_refresh_loop():
         try:
             run_parser()
             check_budget_and_notify()
+            check_scheduled_report()
         except Exception:
             pass
 

@@ -744,7 +744,30 @@ async function openSettings() {
       <div class="field"><label>Webhook URL</label>
         <input type="text" id="cfgWurl" value="${cfg.webhook_url || ''}" placeholder="https://qyapi.weixin.qq.com/... 或 Server酱 KEY">
         <div class="hint">企业微信/钉钉: 机器人 Webhook 地址；Server酱: SendKey（URL 或裸 key 均可）</div></div>
-      <div class="field"><label><input type="checkbox" id="cfgWenabled" ${cfg.webhook_enabled ? 'checked' : ''} style="width:auto;margin-right:6px">启用 Webhook 告警</label></div>
+      <div class="field"><label><input type="checkbox" id="cfgWenabled" ${cfg.webhook_enabled ? 'checked' : ''} style="width:auto;margin-right:6px">启用 Webhook 推送</label>
+        <div class="hint">预算告警与定时报告共用此开关及 Webhook 配置</div></div>
+      <div class="field" style="border-top:1px solid var(--line);padding-top:16px"><label>定时报告</label>
+        <label style="font-weight:400"><input type="checkbox" id="cfgReportEnabled" ${cfg.report_enabled ? 'checked' : ''} style="width:auto;margin-right:6px">启用日报/周报推送</label></div>
+      <div class="row">
+        <div class="field"><label>报告类型</label>
+          <select id="cfgReportType">
+            <option value="daily" ${cfg.report_type === 'weekly' ? '' : 'selected'}>日报（每天）</option>
+            <option value="weekly" ${cfg.report_type === 'weekly' ? 'selected' : ''}>周报（每周一次）</option>
+          </select></div>
+        <div class="field"><label>推送时间</label>
+          <input type="time" id="cfgReportTime" value="${cfg.report_time || '09:00'}"></div>
+      </div>
+      <div class="field"><label>周报推送日</label>
+        <select id="cfgReportWeekday">
+          <option value="1" ${Number(cfg.report_weekday ?? 1) === 1 ? 'selected' : ''}>周一</option>
+          <option value="2" ${Number(cfg.report_weekday) === 2 ? 'selected' : ''}>周二</option>
+          <option value="3" ${Number(cfg.report_weekday) === 3 ? 'selected' : ''}>周三</option>
+          <option value="4" ${Number(cfg.report_weekday) === 4 ? 'selected' : ''}>周四</option>
+          <option value="5" ${Number(cfg.report_weekday) === 5 ? 'selected' : ''}>周五</option>
+          <option value="6" ${Number(cfg.report_weekday) === 6 ? 'selected' : ''}>周六</option>
+          <option value="7" ${Number(cfg.report_weekday) === 7 ? 'selected' : ''}>周日</option>
+        </select>
+        <div class="hint">仅周报生效；日报每天按推送时间发送</div></div>
       <div class="field"><label>数据接入 Key</label>
         <input type="text" id="cfgIngestKey" value="${cfg.ingest_key || ''}" placeholder="留空=仅允许登录 Token">
         <div class="hint">调用 POST /api/ingest 时可通过 X-Ingest-Key 认证</div></div>
@@ -777,6 +800,10 @@ async function openSettings() {
       webhook_type: document.getElementById('cfgWtype').value,
       webhook_url: document.getElementById('cfgWurl').value.trim(),
       webhook_enabled: document.getElementById('cfgWenabled').checked,
+      report_enabled: document.getElementById('cfgReportEnabled').checked,
+      report_type: document.getElementById('cfgReportType').value,
+      report_time: document.getElementById('cfgReportTime').value || '09:00',
+      report_weekday: parseInt(document.getElementById('cfgReportWeekday').value, 10) || 1,
       ingest_key: document.getElementById('cfgIngestKey').value.trim(),
     };
     try {

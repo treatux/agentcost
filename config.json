@@ -6,5 +6,9 @@
   "webhook_type": "generic",
   "webhook_url": "",
   "notify_cooldown_hours": 12,
+  "report_enabled": false,
+  "report_time": "09:00",
+  "report_weekday": 1,
+  "report_type": "daily",
   "monthly_budget_usd": 250
 }
