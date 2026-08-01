@@ -873,7 +873,8 @@ class Handler(BaseHTTPRequestHandler):
             skipped = 0
             seen_request_ids = set()
             for row in rows:
-                request_id = row[-1]
+                # rows 结构末尾: (..., request_id, record_user)，request_id 在倒数第二位
+                request_id = row[-2]
                 if request_id is not None:
                     exists = cur.execute(
                         "SELECT COUNT(*) FROM usage_records WHERE source='api' AND request_id = ?",
