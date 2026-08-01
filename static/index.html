@@ -775,10 +775,15 @@ async function loadFilters() {
 async function openSettings() {
   let cfg = {};
   let users = [];
+  let officialPrices = { fetched_at: '', count: 0 };
   try {
     const r = await api('api/config');
     cfg = r.config || {};
   } catch (e) { /* 继续用默认 */ }
+  try {
+    const r = await api('api/prices');
+    if (r.ok) officialPrices = r;
+  } catch (e) { /* 价格缓存不可用时仍可打开设置 */ }
   if (state.role === 'admin' && !state.readonly) {
     try {
       const r = await api('api/users');
@@ -791,6 +796,9 @@ async function openSettings() {
   const cur = cfg.budget_currency || 'cny';
   // 预算显示值：若配置是 USD 但默认 cny，转换展示
   let budgetVal = cfg.monthly_budget ?? 2000;
+  const officialUpdated = officialPrices.fetched_at
+    ? new Date(officialPrices.fetched_at).toLocaleString()
+    : '尚未更新';
   if (cur === 'usd' && (cfg.budget_currency_orig !== 'usd')) { /* 保持原值 */ }
   mask.innerHTML = `
     <div class="modal">
@@ -854,6 +862,9 @@ async function openSettings() {
       <div class="field"><label>数据接入 Key</label>
         <input type="text" id="cfgIngestKey" value="${cfg.ingest_key || ''}" placeholder="留空=仅允许登录 Token">
         <div class="hint">调用 POST /api/ingest 时可通过 X-Ingest-Key 认证</div></div>
+      <div class="field" style="border-top:1px solid var(--line);padding-top:16px"><label>模型价格管理</label>
+        <div style="display:flex;align-items:center;gap:10px"><span class="hint" id="officialPriceUpdated">官方价格：最后更新 ${escHtml(officialUpdated)}${officialPrices.count ? `（${officialPrices.count} 个本地模型匹配）` : ''}</span><button id="cfgFetchOfficial">立即更新官方价格</button></div>
+        <div class="hint">官方基础价来自 OpenRouter，按既有上游倍率计算；手动价格覆盖优先。</div></div>
       <div class="field" style="border-top:1px solid var(--line);padding-top:16px"><label>只读分享</label>
         <div class="hint">${cfg.share_enabled ? '已启用：任何拿到链接的人可只读查看，无修改权限' : '未启用'}</div>
         <div style="display:flex;gap:8px;margin-top:8px"><input id="shareUrl" type="text" readonly value="${cfg.share_enabled && cfg.share_token ? location.origin + '/share/?token=' + cfg.share_token : ''}" placeholder="生成后显示分享链接" style="flex:1"><button id="shareCreate">生成链接</button><button id="shareCopy">复制</button><button id="shareRevoke">撤销</button></div></div>
@@ -873,6 +884,23 @@ async function openSettings() {
   mask.addEventListener('click', e => { if (e.target === mask) mask.remove(); });
   document.getElementById('cfgCancel').onclick = () => mask.remove();
   document.getElementById('cfgModels').onclick = () => openModelsManager();
+  document.getElementById('cfgFetchOfficial').onclick = async () => {
+    const button = document.getElementById('cfgFetchOfficial');
+    const st = document.getElementById('cfgStatus');
+    button.disabled = true;
+    st.className = 'status'; st.textContent = '正在更新官方价格...';
+    try {
+      const r = await api('api/prices/fetch', { method: 'POST' });
+      if (!r.ok) throw new Error(r.error || '更新失败');
+      await loadFilters();
+      load();
+      const updated = r.fetched_at ? new Date(r.fetched_at).toLocaleString() : '刚刚';
+      document.getElementById('officialPriceUpdated').textContent = `官方价格：最后更新 ${updated}`;
+      st.className = 'status ok'; st.textContent = `✅ 已更新 ${r.fetched} 个官方模型价格，模型列表已刷新`;
+    } catch (e) {
+      st.className = 'status err'; st.textContent = '❌ ' + e.message;
+    } finally { button.disabled = false; }
+  };
   document.getElementById('cfgTest').onclick = async () => {
     const st = document.getElementById('cfgStatus');
     st.className = 'status'; st.textContent = '发送中...';

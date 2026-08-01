@@ -9,6 +9,7 @@ import glob
 import os
 import re
 import sqlite3
+import urllib.request
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -72,7 +73,9 @@ PLAN_PROVIDERS = {"anthropic", "openai"}  # 官方订阅可能走 plan
 
 # ---- 用户自定义模型覆盖（models_override.json）----
 OVERRIDE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models_override.json")
+OFFICIAL_PRICES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "official_prices.json")
 _ovr = {}
+_official_prices = None
 
 
 def load_overrides():
@@ -93,6 +96,76 @@ def save_overrides(overrides):
     with open(OVERRIDE_PATH, "w", encoding="utf-8") as f:
         json.dump(_ovr, f, ensure_ascii=False, indent=2)
     return _ovr
+
+
+def load_official_prices():
+    """加载 OpenRouter 抓取的官方基础价格缓存。"""
+    global _official_prices
+    fallback = {"fetched_at": "", "prices": {}}
+    try:
+        with open(OFFICIAL_PRICES_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or not isinstance(data.get("prices"), dict):
+            raise ValueError("官方价格缓存格式无效")
+        _official_prices = {
+            "fetched_at": str(data.get("fetched_at") or ""),
+            "prices": data["prices"],
+        }
+    except Exception:
+        _official_prices = fallback
+    return _official_prices
+
+
+def fetch_official_prices():
+    """从 OpenRouter 获取模型官方价格，返回 (成功数, 失败原因)。"""
+    try:
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/models",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        models = payload.get("data")
+        if not isinstance(models, list):
+            raise ValueError("响应中缺少 data 模型列表")
+        prices = {}
+        for item in models:
+            if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+                continue
+            pricing = item.get("pricing") or {}
+            try:
+                price_in = round(float(pricing["prompt"]) * 1_000_000, 4)
+                price_out = round(float(pricing["completion"]) * 1_000_000, 4)
+            except (KeyError, TypeError, ValueError):
+                continue
+            prices[item["id"]] = {"price_in": price_in, "price_out": price_out}
+        if not prices:
+            raise ValueError("响应中没有可用价格")
+        data = {"fetched_at": datetime.now(timezone.utc).isoformat(), "prices": prices}
+        tmp_path = OFFICIAL_PRICES_PATH + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, OFFICIAL_PRICES_PATH)
+        global _official_prices
+        _official_prices = data
+        return len(prices), ""
+    except Exception as e:
+        return 0, str(e)
+
+
+def get_official_price(model, prices=None):
+    """按完整模型名、再按去掉供应商前缀的短名查找官方价格。"""
+    prices = prices if prices is not None else load_official_prices().get("prices", {})
+    if not isinstance(prices, dict):
+        return None
+    short = model.split("/")[-1]
+    price = prices.get(model) or prices.get(short)
+    if price:
+        return price
+    for name, candidate in prices.items():
+        if name.split("/")[-1] == short:
+            return candidate
+    return None
 
 
 def get_override(model):
@@ -140,10 +213,19 @@ def get_model_price(model, upstream):
         po = ovr.get("price_out")
         if pi is not None and po is not None:
             return float(pi), float(po)
-    fam = MODEL_FAMILY.get(model) or MODEL_FAMILY.get(model.split("/")[-1])
-    if not fam:
-        return None, None
-    base = BASE_PRICES.get(fam)
+    global _official_prices
+    if _official_prices is None:
+        load_official_prices()
+    price = get_official_price(model, _official_prices.get("prices", {}))
+    try:
+        base = (float(price["price_in"]), float(price["price_out"])) if price else None
+    except (KeyError, TypeError, ValueError):
+        base = None
+    if base is None:
+        fam = MODEL_FAMILY.get(model) or MODEL_FAMILY.get(model.split("/")[-1])
+        if not fam:
+            return None, None
+        base = BASE_PRICES.get(fam)
     if not base:
         return None, None
     mult = 1
@@ -490,6 +572,8 @@ def build_db(records, db_path):
 
 
 def main():
+    load_overrides()
+    load_official_prices()
     records = scan_all()
     print(f"扫描到 {len(records)} 条用量记录")
     # 汇总

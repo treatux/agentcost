@@ -18,6 +18,7 @@ import hmac
 import subprocess
 import threading
 import urllib.request
+import parser as cost_parser
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -36,6 +37,7 @@ USERS_PATH = os.path.join(DB_DIR, "users.json")
 PORT = int(os.environ.get("AGENTCOST_PORT", "8666"))
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 AUTO_REFRESH_SECONDS = int(os.environ.get("AGENTCOST_REFRESH_SECONDS", "300"))  # 默认每 5 分钟自动刷新
+_last_price_fetch_date = None
 
 # ---- 自动刷新：定时重跑 parser 更新 DB ----
 def run_parser():
@@ -158,6 +160,23 @@ def model_catalog(user=None):
         }
         models.append(entry)
     return {"models": models, "overrides": ovr}
+
+
+def official_prices_for_local_models():
+    """仅返回本地用量数据库中出现过的模型的官方价格。"""
+    cached = cost_parser.load_official_prices()
+    all_prices = cached.get("prices", {})
+    try:
+        rows = query_db("SELECT DISTINCT model FROM usage_records WHERE model IS NOT NULL AND model != ''")
+    except sqlite3.Error:
+        rows = []
+    prices = {}
+    for row in rows:
+        model = row["model"]
+        price = cost_parser.get_official_price(model, all_prices)
+        if isinstance(price, dict):
+            prices[model] = price
+    return {"fetched_at": cached.get("fetched_at", ""), "prices": prices}
 
 
 def send_webhook(text):
@@ -406,8 +425,33 @@ def check_scheduled_report():
     send_webhook(build_report_text(kind))
 
 
+def maybe_fetch_official_prices():
+    """每天最多自动抓取一次；已有未满 24 小时的缓存直接复用。"""
+    global _last_price_fetch_date
+    now = datetime.now().astimezone()
+    today = now.date().isoformat()
+    if _last_price_fetch_date == today:
+        return False
+    cached = cost_parser.load_official_prices()
+    try:
+        fetched_at = str(cached.get("fetched_at") or "").replace("Z", "+00:00")
+        last_fetch = datetime.fromisoformat(fetched_at)
+        if last_fetch.tzinfo is None:
+            last_fetch = last_fetch.replace(tzinfo=now.tzinfo)
+        if (now - last_fetch.astimezone(now.tzinfo)).total_seconds() < 24 * 3600:
+            return False
+    except (TypeError, ValueError):
+        pass
+    fetched, _error = cost_parser.fetch_official_prices()
+    if fetched:
+        _last_price_fetch_date = today
+        return True
+    return False
+
+
 def auto_refresh_loop():
     """后台线程：启动时刷一次，之后每 5 分钟刷一次；每次刷新后检查预算。"""
+    maybe_fetch_official_prices()
     run_parser()
     load_config()
     check_budget_and_notify()
@@ -415,6 +459,7 @@ def auto_refresh_loop():
     while True:
         time.sleep(AUTO_REFRESH_SECONDS)
         try:
+            maybe_fetch_official_prices()
             run_parser()
             check_budget_and_notify()
             check_anomaly_and_notify()
@@ -965,6 +1010,20 @@ class Handler(BaseHTTPRequestHandler):
                 return
             ok = send_webhook("✅ AgentCost 测试通知：Webhook 配置成功！")
             self.send_json({"ok": ok, "sent": ok, "error": None if ok else "发送失败，请检查 URL 和类型"})
+        elif self.path == "/api/prices/fetch":
+            token = self.headers.get("X-Token", "")
+            if not check_token(token):
+                self.send_json({"ok": False, "error": "未登录"}, status=401)
+                return
+            fetched, error = cost_parser.fetch_official_prices()
+            if fetched:
+                global _last_price_fetch_date
+                _last_price_fetch_date = datetime.now().astimezone().date().isoformat()
+                run_parser()
+                cached = cost_parser.load_official_prices()
+                self.send_json({"ok": True, "fetched": fetched, "fetched_at": cached.get("fetched_at", "")})
+            else:
+                self.send_json({"ok": False, "fetched": 0, "error": error or "抓取失败"}, status=502)
         elif self.path == "/api/models":
             token = self.headers.get("X-Token", "")
             if not check_token(token):
@@ -1140,6 +1199,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "未登录"}, status=401)
                 return
             self.send_json({"ok": True, **model_catalog(scoped_user(identity, params.get("user", [""])[0]))})
+        elif path == "/api/prices":
+            if not token_info:
+                self.send_json({"ok": False, "error": "未登录"}, status=401)
+                return
+            data = official_prices_for_local_models()
+            self.send_json({"ok": True, "fetched_at": data["fetched_at"],
+                            "count": len(data["prices"]), "prices": data["prices"]})
         elif path == "/api/export":
             if not token_info:
                 self.send_json({"ok": False, "error": "未登录"}, status=401)
