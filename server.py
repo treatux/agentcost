@@ -9,6 +9,8 @@ import json
 import os
 import sys
 import time
+import csv
+import io
 import sqlite3
 import secrets
 import hashlib
@@ -486,6 +488,40 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def send_export_csv(self, frm, to):
+        """导出所选范围的用量明细为 CSV。"""
+        to_next = (datetime.strptime(to, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute("""
+            SELECT ts, agent, model, upstream, billing_mode,
+                   input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                   total_tokens, cost_usd
+            FROM usage_records WHERE ts >= ? AND ts < ?
+            ORDER BY ts
+        """, (frm, to_next)).fetchall()
+        conn.close()
+
+        buf = io.StringIO()
+        buf.write("\ufeff")  # UTF-8 BOM，Excel 打开中文不乱码
+        writer = csv.writer(buf)
+        writer.writerow(["时间", "Agent", "模型", "上游", "计费模式",
+                         "输入Token", "输出Token", "缓存读Token", "缓存写Token",
+                         "总Token", "成本USD", "成本CNY"])
+        fx = fetch_fx_rate()
+        for r in rows:
+            ts, agent, model, upstream, bm, inp, out, cr, cw, total, cost = r
+            writer.writerow([ts, agent, model, upstream, bm,
+                             inp or 0, out or 0, cr or 0, cw or 0,
+                             total or 0, round(cost or 0, 4), round((cost or 0) * fx, 2)])
+        data = buf.getvalue().encode("utf-8")
+        fname = f"agentcost_{frm}_to_{to}.csv"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self):
         path = urlparse(self.path).path
         params = parse_qs(urlparse(self.path).query)
@@ -514,6 +550,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "未登录"}, status=401)
                 return
             self.send_json({"ok": True, **model_catalog()})
+        elif path == "/api/export":
+            token = self.headers.get("X-Token", "")
+            if not check_token(token):
+                self.send_json({"ok": False, "error": "未登录"}, status=401)
+                return
+            frm, to = parse_range(params)
+            self.send_export_csv(frm, to)
         elif path == "/" or path == "/index.html":
             self.send_file(os.path.join(STATIC_DIR, "index.html"))
         elif path.startswith("/static/"):

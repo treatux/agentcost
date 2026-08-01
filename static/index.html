@@ -61,8 +61,40 @@
   .card .value small { font-size: 13px; color: var(--muted); font-weight: 400; margin-left: 6px; }
 
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-  @media (max-width: 768px) { .grid2 { grid-template-columns: 1fr; } }
-  .scroll-box { max-height: 300px; overflow-y: auto; border-radius: 8px; }
+  /* ===== 移动端适配 ===== */
+  @media (max-width: 768px) {
+    .grid2 { grid-template-columns: 1fr; }
+    .wrap { padding: 20px 14px 60px; }
+    header { margin-bottom: 20px; }
+    h1 { font-size: 20px; }
+    .head-sub { font-size: 12px; }
+    .cards { grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 22px; }
+    .card { padding: 16px 14px; border-radius: 12px; }
+    .card .label { font-size: 11px; margin-bottom: 8px; }
+    .card .value { font-size: 19px; }
+    .card .value small { font-size: 11px; margin-left: 2px; display: block; margin-top: 2px; }
+    .toolbar { gap: 8px; margin-bottom: 18px; }
+    .toolbar label { font-size: 12px; }
+    .toolbar input[type="date"] { padding: 7px 8px; font-size: 12px; flex: 1; min-width: 0; }
+    .quick { flex-wrap: wrap; }
+    .quick button { padding: 6px 10px; font-size: 12px; }
+    .cur-select { padding: 6px 8px; font-size: 12px; }
+    .logout { padding: 6px 6px; font-size: 12px; }
+    .panel { padding: 16px 12px; border-radius: 12px; margin-bottom: 10px; }
+    h2 { font-size: 14px; margin-bottom: 10px; }
+    table { font-size: 12px; }
+    th, td { padding: 7px 6px; }
+    /* 表格窄屏横向滚动：容器允许横滚，表格保持最小宽度 */
+    .scroll-box { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .scroll-box table { min-width: 620px; }
+    /* SVG 有 viewBox 自适应，无需横滚 */
+    .chart-tabs button { padding: 4px 10px; font-size: 11px; }
+    .modal { padding: 20px 16px; }
+    .modal .row { flex-direction: column; gap: 10px; }
+  }
+  .scroll-box { max-height: 300px; overflow-y: auto; border-radius: 8px; min-width: 0; max-width: 100%; }
+  .grid2 > * { min-width: 0; }
+  .panel { max-width: 100%; }
   .scroll-box::-webkit-scrollbar { width: 6px; }
   .scroll-box::-webkit-scrollbar-track { background: transparent; }
   .scroll-box::-webkit-scrollbar-thumb { background: #e0ddd4; border-radius: 3px; }
@@ -175,6 +207,8 @@ function fmtCost(n, isPrice = false) {
   return '¥' + (cny >= 100 ? cny.toFixed(0) : cny.toFixed(2));
 }
 function fmtPrice(p) { return fmtCost(p, true); }
+/* Y 轴刻度：整数显示整数，小数保留两位 */
+function fmtAxis(n) { return Math.round(n) === n ? String(Math.round(n)) : n.toFixed(2); }
 function pct(n, total) { return total ? (n / total * 100) : 0; }
 
 /* ---------- SVG 图表（带 hover） ---------- */
@@ -237,8 +271,8 @@ function svgLineChart(daily, dim = 'tokens') {
   let grid = '';
   for (let g = 0; g <= 4; g++) {
     const y = PT + ih - (g / 4) * ih;
-    const val = Math.round(max * g / 4);
-    const valTxt = dim === 'cnt' ? val + '' : fmtTokens(val);
+    const val = max * g / 4;
+    const valTxt = dim === 'cnt' ? val + '' : dim === 'cost' ? fmtAxis(val) : fmtTokens(val);
     grid += `<line x1="${PL}" y1="${y}" x2="${W - PR}" y2="${y}" stroke="#e4e2db" stroke-width="1"/>`;
     grid += `<text x="${PL - 8}" y="${y + 3}" text-anchor="end" font-size="11" fill="#8a8a85">${valTxt}</text>`;
   }
@@ -274,7 +308,7 @@ function svgBarChart(models, dim = 'tokens') {
     const valTxt = dim === 'cnt' ? v + ' 次' : dim === 'cost' ? fmtCost(v) : fmtTokens(v);
     const tip = `<div class="tip-t">${models[i].model}</div><div>上游: ${models[i].upstream || '—'}</div><div>${dim === 'cnt' ? '请求数' : dim === 'cost' ? '成本' : 'Tokens'}: <span class="tip-v">${valTxt}</span></div>`;
     bars += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" rx="4" fill="#d97757" opacity=".85"/>`;
-    bars += `<text x="${(x + barW / 2).toFixed(1)}" y="${(y - 6).toFixed(1)}" text-anchor="middle" font-size="11" fill="#8a8a85" font-weight="600">${dim === 'cnt' ? v : fmtTokens(v)}</text>`;
+    bars += `<text x="${(x + barW / 2).toFixed(1)}" y="${(y - 6).toFixed(1)}" text-anchor="middle" font-size="11" fill="#8a8a85" font-weight="600">${dim === 'cnt' ? v : dim === 'cost' ? fmtAxis(v) : fmtTokens(v)}</text>`;
     bars += `<rect class="hoverable" data-tip="${tip.replace(/"/g, '&quot;')}" x="${x.toFixed(1)}" y="${PT}" width="${barW.toFixed(1)}" height="${ih.toFixed(1)}" fill="transparent" style="pointer-events:all"/>`;
     labels += `<text x="${(x + barW / 2).toFixed(1)}" y="${H - 28}" text-anchor="middle" font-size="10" fill="#8a8a85">${short}</text>`;
     labels += `<text x="${(x + barW / 2).toFixed(1)}" y="${H - 12}" text-anchor="middle" font-size="9.5" fill="#c9cede">${models[i].upstream || ''}</text>`;
@@ -283,9 +317,9 @@ function svgBarChart(models, dim = 'tokens') {
   let grid = '';
   for (let g = 0; g <= 4; g++) {
     const y = PT + ih - (g / 4) * ih;
-    const val = Math.round(max * g / 4);
+    const val = max * g / 4;
     grid += `<line x1="${PL}" y1="${y}" x2="${W - PR}" y2="${y}" stroke="#e4e2db" stroke-width="1"/>`;
-    grid += `<text x="${PL - 8}" y="${y + 3}" text-anchor="end" font-size="11" fill="#8a8a85">${dim === 'cnt' ? val : fmtTokens(val)}</text>`;
+    grid += `<text x="${PL - 8}" y="${y + 3}" text-anchor="end" font-size="11" fill="#8a8a85">${dim === 'cnt' ? val : dim === 'cost' ? fmtAxis(val) : fmtTokens(val)}</text>`;
   }
 
   return `<div class="chart-box"><svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto" role="img">
@@ -375,6 +409,7 @@ function renderToolbar() {
         <button data-all="1">全部</button>
       </div>
       <div class="spacer"></div>
+      <button class="logout" id="exportBtn">⬇ 导出</button>
       <select class="cur-select" id="curSel">
         <option value="cny" ${getCurrency() === 'cny' ? 'selected' : ''}>¥ 人民币</option>
         <option value="usd" ${getCurrency() === 'usd' ? 'selected' : ''}>$ 美元</option>
@@ -455,6 +490,25 @@ function bindToolbar() {
   document.getElementById('from').onchange = load;
   document.getElementById('to').onchange = load;
   document.getElementById('logout').onclick = () => { localStorage.removeItem(TOKEN_KEY); renderLogin(); };
+  document.getElementById('exportBtn').onclick = () => {
+    const q = new URLSearchParams();
+    if (state.from) q.set('from', state.from);
+    if (state.to) q.set('to', state.to);
+    // 带 token 下载
+    fetch('api/export?' + q.toString(), { headers: { 'X-Token': localStorage.getItem(TOKEN_KEY) } })
+      .then(r => {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.blob();
+      })
+      .then(blob => {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `agentcost_${state.from || 'all'}_to_${state.to || 'all'}.csv`;
+        a.click();
+        URL.revokeObjectURL(a.href);
+      })
+      .catch(e => alert('导出失败: ' + e.message));
+  };
   document.getElementById('settingsBtn').onclick = openSettings;
   document.getElementById('curSel').onchange = (e) => {
     setCurrency(e.target.value);
