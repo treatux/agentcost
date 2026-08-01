@@ -165,6 +165,21 @@ def get_billing_mode(model, provider, upstream):
     return "api"
 
 
+def get_cache_prices(model, price_in):
+    """获取该模型的缓存读/缓存写价格（美元/百万token）。
+
+    优先用户覆盖（models_override.json 的 cache_price_in/cache_price_write），
+    否则按行业通用系数推算：缓存读 = 输入价×0.1，缓存写 = 输入价×1.25。
+    返回 (cache_read_price, cache_write_price)；price_in 缺失时返回 (None, None)。
+    """
+    if price_in is None:
+        return None, None
+    ovr = get_override(model)
+    cache_read = ovr.get("cache_price_in") if ovr and ovr.get("cache_price_in") is not None else round(price_in * 0.1, 4)
+    cache_write = ovr.get("cache_price_write") if ovr and ovr.get("cache_price_write") is not None else round(price_in * 1.25, 4)
+    return float(cache_read), float(cache_write)
+
+
 def parse_codex_session(path):
     """解析单个 Codex 会话 jsonl，返回用量聚合 dict 列表。"""
     records = []
@@ -259,15 +274,33 @@ def normalize_usage(usage):
 
 
 def estimate_cost(model, usage, upstream="custom", billing_mode="api"):
-    """根据上游价格估算美元成本。"""
+    """根据实际价格估算美元成本。
+
+    实际价格 = 未缓存价 + 缓存价，分项计费：
+      新输入 token × 输入价
+    + 缓存读 token × 缓存读价（用户覆盖优先，否则 输入价×0.1）
+    + 缓存写 token × 缓存写价（用户覆盖优先，否则 输入价×1.25）
+    + 输出 token × 输出价
+    """
     if billing_mode == "coding_plan":
         return 0
     price_in, price_out = get_model_price(model, upstream)
     if price_in is None or price_out is None:
         return None
-    input_tokens = (usage.get("input_tokens") or 0) + (usage.get("cache_read_input_tokens") or 0) * 0.1 + (usage.get("cache_creation_input_tokens") or 0) * 1.25
-    output_tokens = (usage.get("output_tokens") or 0) + (usage.get("reasoning_output_tokens") or 0)
-    return round(input_tokens / 1e6 * price_in + output_tokens / 1e6 * price_out, 6)
+    cache_read_price, cache_write_price = get_cache_prices(model, price_in)
+    if cache_read_price is None or cache_write_price is None:
+        return None
+    new_input = usage.get("input_tokens") or 0
+    cache_read = usage.get("cache_read_input_tokens") or 0
+    cache_write = usage.get("cache_creation_input_tokens") or 0
+    output = (usage.get("output_tokens") or 0) + (usage.get("reasoning_output_tokens") or 0)
+    cost = (
+        new_input / 1e6 * price_in
+        + cache_read / 1e6 * cache_read_price
+        + cache_write / 1e6 * cache_write_price
+        + output / 1e6 * price_out
+    )
+    return round(cost, 6)
 
 
 def scan_hermes():
