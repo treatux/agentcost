@@ -240,7 +240,15 @@ function bindChartHover() {
           const PL = 64, iw = vb.width - 64 - 20;
           const idx = Math.max(0, Math.min(daily.length - 1, Math.round((xRatio - PL) / (iw / Math.max(1, daily.length - 1)))));
           const d = daily[idx];
-          t = `<div class="tip-t">${d.day}</div><div>Tokens: <span class="tip-v">${fmtTokens(d.tokens)}</span></div><div>成本: <span class="tip-v">${fmtCost(d.cost)}</span></div>`;
+          // 跟随当前激活维度（请求数/成本/Tokens）
+          const panel = el.closest('.panel');
+          const activeBtn = panel ? panel.querySelector('.chart-tabs button.on') : null;
+          const dim = activeBtn ? activeBtn.dataset.dim : 'tokens';
+          let label, valTxt;
+          if (dim === 'cnt') { label = '请求数'; valTxt = d.cnt + ' 次'; }
+          else if (dim === 'cost') { label = '成本'; valTxt = fmtCost(d.cost); }
+          else { label = 'Tokens'; valTxt = fmtTokens(d.tokens); }
+          t = `<div class="tip-t">${d.day}</div><div>${label}: <span class="tip-v">${valTxt}</span></div>`;
         }
       }
       if (!t) return;
