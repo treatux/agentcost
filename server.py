@@ -61,6 +61,9 @@ DEFAULT_CONFIG = {
     "webhook_type": "generic",   # wecom / serverchan / dingtalk / generic
     "webhook_url": "",
     "notify_cooldown_hours": 12, # 同一告警等级 12 小时内不重复通知
+    "anomaly_enabled": False,
+    "anomaly_multiplier": 3.0,
+    "anomaly_cooldown_hours": 24,
     "report_enabled": False,
     "report_time": "09:00",     # 每日推送时间（24 小时制）
     "report_weekday": 1,          # 周报推送日：1=周一 ... 7=周日，0=每天
@@ -71,6 +74,7 @@ DEFAULT_CONFIG = {
 }
 _config = dict(DEFAULT_CONFIG)
 _last_notify = {}  # level -> timestamp
+_last_anomaly_notify = {}  # anomaly level -> timestamp
 _last_report_date = None  # YYYY-MM-DD，仅在当前进程内防止同日重复推送
 
 
@@ -228,6 +232,60 @@ def check_budget_and_notify():
         print(f"[budget] 检查失败: {e}")
 
 
+def check_anomaly_and_notify():
+    """比较今日成本与最近 7 个有数据日期的日均成本并发送异常告警。"""
+    if not _config.get("anomaly_enabled", False):
+        return
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cost_today = cur.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM usage_records WHERE ts LIKE ?",
+            (today + "%",),
+        ).fetchone()[0] or 0
+        # 以最近 7 个（不含今天）有记录的自然日为基准，避免单日多条记录影响平均值。
+        daily_rows = cur.execute(
+            """SELECT substr(ts, 1, 10) AS day, COALESCE(SUM(cost_usd), 0) AS cost
+               FROM usage_records
+               WHERE substr(ts, 1, 10) < ?
+               GROUP BY day ORDER BY day DESC LIMIT 7""",
+            (today,),
+        ).fetchall()
+        conn.close()
+        if not daily_rows:
+            return
+        cost_avg = sum(float(row[1] or 0) for row in daily_rows) / len(daily_rows)
+        multiplier = float(_config.get("anomaly_multiplier", 3.0) or 3.0)
+        if multiplier < 1.5:
+            multiplier = 1.5
+        if cost_avg <= 0 or cost_today <= cost_avg * multiplier:
+            return
+
+        now = time.time()
+        cooldown = float(_config.get("anomaly_cooldown_hours", 24) or 24) * 3600
+        level = "anomaly"
+        if now - _last_anomaly_notify.get(level, 0) < cooldown:
+            return
+        _last_anomaly_notify[level] = now
+
+        currency = _config.get("budget_currency", "cny")
+        fx = fetch_fx_rate()
+        if currency == "cny":
+            today_text = f"¥{cost_today * fx:.2f}（USD ${cost_today:.2f}）"
+            avg_text = f"¥{cost_avg * fx:.2f}"
+        else:
+            today_text = f"${cost_today:.2f}"
+            avg_text = f"${cost_avg:.2f}"
+        text = ("🚨 AgentCost 异常检测\n"
+                f"今日成本: {today_text}\n"
+                f"近7天日均: {avg_text}\n"
+                f"超出倍数: {cost_today / cost_avg:.1f}倍")
+        send_webhook(text)
+    except Exception as e:
+        print(f"[anomaly] 检查失败: {e}")
+
+
 def _format_report_money(data, key="cost"):
     """按预算货币格式化汇总中的金额。"""
     usd_key = "saved_usd" if key == "saved" else key
@@ -345,11 +403,13 @@ def auto_refresh_loop():
     run_parser()
     load_config()
     check_budget_and_notify()
+    check_anomaly_and_notify()
     while True:
         time.sleep(AUTO_REFRESH_SECONDS)
         try:
             run_parser()
             check_budget_and_notify()
+            check_anomaly_and_notify()
             check_scheduled_report()
         except Exception:
             pass

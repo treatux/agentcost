@@ -1,17 +1,19 @@
 {
-  "monthly_budget": 3000,
+  "monthly_budget": 2000.0,
   "budget_currency": "cny",
   "alert_threshold": 0.8,
   "webhook_enabled": false,
   "webhook_type": "generic",
   "webhook_url": "",
   "notify_cooldown_hours": 12,
+  "anomaly_enabled": false,
+  "anomaly_multiplier": 0.0001,
+  "anomaly_cooldown_hours": 24,
   "report_enabled": false,
   "report_time": "09:00",
   "report_weekday": 1,
   "report_type": "daily",
   "ingest_key": "",
-  "share_enabled": true,
-  "share_token": "z2-Xnv-diOmNf8hEI-SqDA",
-  "monthly_budget_usd": 250
+  "share_enabled": false,
+  "share_token": ""
 }
