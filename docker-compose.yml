@@ -15,7 +15,7 @@ services:
       - AGENTCOST_REFRESH_SECONDS=300
     volumes:
       # 数据持久化（DB + 配置）
-      - ./agentcost_data:/data
+      - ./data:/data
       # 宿主机 AI agent 日志（只读）
       - ~/.codex:/logs/codex:ro
       - ~/.claude:/logs/claude:ro

@@ -22,11 +22,15 @@ from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
+__version__ = "1.3.0"
+START_TIME = time.time()
+
 DB_DIR = os.environ.get("AGENTCOST_DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(DB_DIR, "agentcost.db")
 PARSER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parser.py")
-OVERRIDE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models_override.json")
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+# 将可变配置与数据库放在同一个数据目录，容器挂载 /data 后可持久化。
+OVERRIDE_PATH = os.path.join(DB_DIR, "models_override.json")
+CONFIG_PATH = os.path.join(DB_DIR, "config.json")
 PORT = int(os.environ.get("AGENTCOST_PORT", "8666"))
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 AUTO_REFRESH_SECONDS = int(os.environ.get("AGENTCOST_REFRESH_SECONDS", "300"))  # 默认每 5 分钟自动刷新
@@ -655,7 +659,27 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         params = parse_qs(urlparse(self.path).query)
 
-        if path == "/api/summary":
+        if path == "/api/health":
+            records = 0
+            db_ok = False
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                try:
+                    records = conn.execute("SELECT COUNT(*) FROM usage_records").fetchone()[0]
+                    db_ok = True
+                finally:
+                    conn.close()
+            except sqlite3.Error:
+                # 数据库尚未初始化或不可用时，仍返回服务进程的健康状态。
+                pass
+            self.send_json({
+                "ok": True,
+                "version": __version__,
+                "db_ok": db_ok,
+                "records": records,
+                "uptime_seconds": int(time.time() - START_TIME),
+            })
+        elif path == "/api/summary":
             token = self.headers.get("X-Token", "")
             if not check_token(token):
                 self.send_json({"ok": False, "error": "未登录"}, status=401)
@@ -697,6 +721,8 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     print(f"AgentCost v3 仪表盘: http://localhost:{PORT}")
     print(f"自动刷新: 每 {AUTO_REFRESH_SECONDS} 秒")
+    # 自定义数据目录（例如 Docker 的 /data）可能尚不存在。
+    os.makedirs(DB_DIR, exist_ok=True)
     # 在接受请求前加载配置，确保独立接入 Key 立即生效。
     load_config()
     # 启动自动刷新线程（守护线程，随主进程退出）
