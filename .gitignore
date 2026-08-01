@@ -1,6 +1,4 @@
-agentcost.db
-docker_test_data/
-agentcost_data/
+backups/
+*.db-wal
+*.db-shm
 __pycache__/
-*.pyc
-*.bak
