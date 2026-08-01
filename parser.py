@@ -384,13 +384,16 @@ def build_db(records, db_path):
             reasoning_tokens INTEGER,
             total_tokens INTEGER,
             cost_usd REAL,
-            source TEXT DEFAULT 'parser'
+            source TEXT DEFAULT 'parser',
+            request_id TEXT
         )
     """)
     # 兼容旧库：为已有表补充来源列；归一化历史上游名称并仅清理保留窗口外的解析器数据。
     cols = {row[1] for row in cur.execute("PRAGMA table_info(usage_records)").fetchall()}
     if "source" not in cols:
         cur.execute("ALTER TABLE usage_records ADD COLUMN source TEXT DEFAULT 'parser'")
+    if "request_id" not in cols:
+        cur.execute("ALTER TABLE usage_records ADD COLUMN request_id TEXT")
     cur.execute("UPDATE usage_records SET upstream = lower(upstream) WHERE upstream IS NOT NULL")
     retention_days = int(os.environ.get("AGENTCOST_RETENTION_DAYS", "180"))
     cutoff = (datetime.now() - timedelta(days=retention_days)).strftime("%Y-%m-%d %H:%M:%S")

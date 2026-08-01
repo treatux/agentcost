@@ -732,12 +732,17 @@ class Handler(BaseHTTPRequestHandler):
             except (TypeError, ValueError, OverflowError):
                 self.send_json({"ok": False, "error": "数字字段格式错误"}, status=400)
                 return
+            request_id = item.get("request_id")
+            if request_id is not None and not isinstance(request_id, str):
+                self.send_json({"ok": False, "error": "request_id 必须是字符串"}, status=400)
+                return
             rows.append((
                 item.get("agent", ""), ts, model,
                 *(str(item.get(field, "") or "") for field in str_fields[2:]),
                 values["input_tokens"], values["output_tokens"],
                 values["cache_read_tokens"], values["cache_write_tokens"],
-                values["reasoning_tokens"], values["total_tokens"], values["cost_usd"], "api"
+                values["reasoning_tokens"], values["total_tokens"], values["cost_usd"], "api",
+                request_id,
             ))
 
         conn = sqlite3.connect(DB_PATH)
@@ -746,17 +751,34 @@ class Handler(BaseHTTPRequestHandler):
             cols = {row[1] for row in cur.execute("PRAGMA table_info(usage_records)").fetchall()}
             if "source" not in cols:
                 cur.execute("ALTER TABLE usage_records ADD COLUMN source TEXT DEFAULT 'parser'")
+            if "request_id" not in cols:
+                cur.execute("ALTER TABLE usage_records ADD COLUMN request_id TEXT")
+            insert_rows = []
+            skipped = 0
+            seen_request_ids = set()
+            for row in rows:
+                request_id = row[-1]
+                if request_id is not None:
+                    exists = cur.execute(
+                        "SELECT COUNT(*) FROM usage_records WHERE source='api' AND request_id = ?",
+                        (request_id,),
+                    ).fetchone()[0]
+                    if exists or request_id in seen_request_ids:
+                        skipped += 1
+                        continue
+                    seen_request_ids.add(request_id)
+                insert_rows.append(row)
             cur.executemany("""
                 INSERT INTO usage_records
                 (agent, ts, model, provider, upstream, base_url, billing_mode, price_in, price_out,
                  cwd, originator, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                 reasoning_tokens, total_tokens, cost_usd, source)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, [row[:7] + (None, None) + row[7:] for row in rows])
+                 reasoning_tokens, total_tokens, cost_usd, source, request_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, [row[:7] + (None, None) + row[7:] for row in insert_rows])
             conn.commit()
         finally:
             conn.close()
-        self.send_json({"ok": True, "inserted": len(rows)})
+        self.send_json({"ok": True, "inserted": len(insert_rows), "skipped": skipped, "duplicates": skipped})
 
     def do_POST(self):
         if self.path == "/api/login":

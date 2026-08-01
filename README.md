@@ -86,11 +86,14 @@ curl -X POST http://localhost:8666/api/ingest \
   -d '{
     "agent": "custom-agent",
     "model": "gpt-5.6",
+    "request_id": "usage-2026-08-01-001",
     "input_tokens": 1200,
     "output_tokens": 340,
     "cost_usd": 0.012
   }'
 ```
+
+`request_id` 为可选字符串，用于幂等去重：重复提交同一个 `request_id` 的 API 记录不会重复计数。未提供该字段时保持原有行为，每次请求都会写入。
 
 也可以使用登录 Token：
 
