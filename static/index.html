@@ -53,6 +53,8 @@
   .cur-toggle:hover { border-color: var(--accent); color: var(--accent-dark); }
   .cur-select { background: var(--card); border: 1px solid var(--line); color: var(--text); border-radius: 8px; padding: 7px 12px; font-size: 13px; cursor: pointer; outline: none; }
   .cur-select:hover { border-color: var(--accent); }
+  .model-link { appearance: none; background: none; border: none; padding: 0; color: var(--accent); font: inherit; text-align: left; text-decoration: none; cursor: pointer; }
+  .model-link:hover, .model-link:focus-visible { color: var(--accent-dark); text-decoration: underline; outline: none; }
 
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin-bottom: 36px; }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 22px 20px; }
@@ -187,11 +189,14 @@
 <script>
 const TOKEN_KEY = 'agentcost_token';
 const CURRENCY_KEY = 'agentcost_currency';
-let state = { from: '', to: '', fx: 7.1, agent: '', upstream: '', readonly: false, filters: { agents: [], upstreams: [] } };
+let state = { from: '', to: '', fx: 7.1, agent: '', upstream: '', model: '', readonly: false, filters: { agents: [], upstreams: [], models: [] } };
 let lastScanAt = null;
 
 function getCurrency() { return localStorage.getItem(CURRENCY_KEY) || 'cny'; }
 function setCurrency(c) { localStorage.setItem(CURRENCY_KEY, c); }
+function escHtml(v) {
+  return String(v ?? '').replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));
+}
 
 function fmtTokens(n) {
   if (!n) return '0';
@@ -514,7 +519,7 @@ async function doLogin() {
 
 function renderToolbar() {
   const filterOptions = (items, selected, allLabel) =>
-    `<option value="">${allLabel}</option>${items.map(item => `<option value="${item}" ${item === selected ? 'selected' : ''}>${item}</option>`).join('')}`;
+    `<option value="">${allLabel}</option>${items.map(item => `<option value="${escHtml(item)}" ${item === selected ? 'selected' : ''}>${escHtml(item)}</option>`).join('')}`;
   return `
     <div class="toolbar">
       <label>从</label>
@@ -533,6 +538,9 @@ function renderToolbar() {
       <select class="cur-select" id="filterUp" aria-label="上游筛选">
         ${filterOptions(state.filters.upstreams || [], state.upstream, '全部上游')}
       </select>
+      <select class="cur-select" id="filterModel" aria-label="模型筛选">
+        ${filterOptions(state.filters.models || [], state.model, '全部模型')}
+      </select>
       <div class="spacer"></div>
       ${state.readonly ? '' : '<button class="logout" id="exportBtn">⬇ 导出</button>'}
       <select class="cur-select" id="curSel">
@@ -545,6 +553,8 @@ function renderToolbar() {
 
 function render(el, d) {
   lastScanAt = d.last_scan || null;
+  // 模型筛选项随未按模型筛选的汇总结果更新，避免选中后列表缩成单项。
+  if (!state.model) state.filters.models = [...new Set(d.by_model.map(m => m.model).filter(Boolean))].sort();
   const t = d.total;
   const days = Math.max(1, Math.round((new Date(d.range.to) - new Date(d.range.from)) / 86400000) + 1);
   const forecast = d.forecast_monthly || {};
@@ -576,6 +586,8 @@ function render(el, d) {
   const maxModel = Math.max(...d.by_model.map(m => m.tokens), 1);
   const upstreamNames = { wanlai: 'Wanlai', sub2api: 'sub2api', omniroute: 'OmniRoute', deepseek: 'DeepSeek', nvidia: 'NVIDIA', custom: '自定义', auto: '自动', anthropic: 'Anthropic', openai: 'OpenAI' };
   const byModelHtml = d.by_model.map(m => {
+    const modelName = m.model || 'unknown';
+    const modelText = escHtml(modelName);
     const cachePct = m.cache_rate || 0;
     const cacheColor = cachePct > 80 ? '#3f8a5a' : cachePct > 50 ? '#8a7a3f' : 'var(--muted)';
     // 缓存价格文本：读价/写价
@@ -585,7 +597,7 @@ function render(el, d) {
     }
     const tip = `<div class="tip-t">${m.model}</div><div>上游: ${m.upstream || '—'} · ${m.billing_mode === 'coding_plan' ? 'Coding Plan' : 'API'}</div><div>新输入: <span class="tip-v">${fmtTokens(m.cache_inp_tokens)}</span></div><div>缓存读: <span class="tip-v">${fmtTokens(m.cache_cr_tokens)}</span> (${cachePct}%)</div><div>缓存写: ${fmtTokens(m.cache_cw_tokens)}</div><div>输出: ${fmtTokens(m.out_tokens)}</div><div>成本: <span class="tip-v">${fmtCost(m.cost)}</span></div><div>缓存节省: <span class="tip-v">${fmtCost(m.saved_usd)}</span></div>`;
     return `<tr>
-      <td style="width:22%">${m.model || 'unknown'}</td>
+      <td style="width:22%"><button class="model-link" type="button" data-model="${escHtml(m.model || '')}" title="查看 ${modelText} 的每日趋势">${modelText}</button></td>
       <td style="width:10%"><span class="tag tag-up">${upstreamNames[m.upstream] || m.upstream || '—'}</span></td>
       <td style="width:8%"><span class="tag tag-mode ${m.billing_mode === 'coding_plan' ? 'tag-plan' : ''}">${m.billing_mode === 'coding_plan' ? 'Coding Plan' : 'API'}</span></td>
       <td style="width:13%" class="num muted">${m.price_in ? fmtPrice(m.price_in) + '/' + fmtPrice(m.price_out) : '—'}</td>
@@ -625,7 +637,7 @@ function render(el, d) {
         <div class="panel"><h2>按 Agent</h2><div class="scroll-box"><table><tr><th>来源</th><th>请求数</th><th>Tokens</th><th>成本</th></tr>${byAgentHtml}</table></div></div>
         <div class="panel"><h2>按模型</h2><div class="scroll-box"><table><tr><th>模型</th><th>上游</th><th>计费</th><th>价格(入/出)</th><th>缓存率·价</th><th></th><th>Tokens</th><th>成本</th><th>缓存节省</th></tr>${byModelHtml}</table></div></div>
       </div>
-      <div class="panel" id="linePanel"><h2>每日趋势</h2>${chartTabs('lineTabs', 'tokens')}<div class="chart-note">悬停数据点查看详情</div>${lineChart}<table><tr><th>日期</th><th></th><th>Tokens</th><th>成本</th></tr>${dailyHtml || '<tr><td colspan="4" class="muted">范围内无数据</td></tr>'}</table></div>
+      <div class="panel" id="linePanel"><h2>每日趋势${state.model ? ' · ' + escHtml(state.model) : ''}</h2>${chartTabs('lineTabs', 'tokens')}<div class="chart-note">悬停数据点查看详情</div>${lineChart}<table><tr><th>日期</th><th></th><th>Tokens</th><th>成本</th></tr>${dailyHtml || '<tr><td colspan="4" class="muted">范围内无数据</td></tr>'}</table></div>
       <div class="panel" id="stackPanel"><h2>Token 结构</h2><div class="chart-note">输入、输出、缓存与推理 Token 的每日堆叠趋势；悬停查看明细</div>${stackChart}</div>
     </div>`;
   bindToolbar();
@@ -667,6 +679,15 @@ function bindToolbar() {
   };
   document.getElementById('filterAgent').onchange = (e) => { state.agent = e.target.value; load(); };
   document.getElementById('filterUp').onchange = (e) => { state.upstream = e.target.value; load(); };
+  document.getElementById('filterModel').onchange = (e) => { state.model = e.target.value; load(); };
+  document.querySelectorAll('.model-link').forEach(button => {
+    button.onclick = () => {
+      state.model = button.dataset.model;
+      const select = document.getElementById('filterModel');
+      if (select) select.value = state.model;
+      load();
+    };
+  });
   document.querySelectorAll('.quick button').forEach(b => {
     b.onclick = () => {
       const f = document.getElementById('from'); const t = document.getElementById('to');
@@ -684,14 +705,17 @@ async function load() {
   state.from = f ? f.value : state.from; state.to = t ? t.value : state.to;
   const filterAgent = document.getElementById('filterAgent');
   const filterUp = document.getElementById('filterUp');
+  const filterModel = document.getElementById('filterModel');
   state.agent = filterAgent ? filterAgent.value : state.agent;
   state.upstream = filterUp ? filterUp.value : state.upstream;
+  state.model = filterModel ? filterModel.value : state.model;
   try {
     const q = new URLSearchParams();
     if (state.from) q.set('from', state.from);
     if (state.to) q.set('to', state.to);
     if (state.agent) q.set('agent', state.agent);
     if (state.upstream) q.set('upstream', state.upstream);
+    if (state.model) q.set('model', state.model);
     const requests = [api('api/summary?' + q.toString())];
     if (!state.readonly) requests.push(api('api/config'));
     const [d, cfgResp] = await Promise.all(requests);

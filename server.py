@@ -493,7 +493,7 @@ def parse_range(params):
     return frm, to
 
 
-def summary(frm, to, agent=None, upstream=None):
+def summary(frm, to, agent=None, upstream=None, model=None):
     """范围汇总。"""
     def agg(cond, params):
         r = query_db(f"""
@@ -513,6 +513,9 @@ def summary(frm, to, agent=None, upstream=None):
     if upstream:
         filter_cond.append("upstream = ?")
         filter_params.append(upstream)
+    if model:
+        filter_cond.append("model = ?")
+        filter_params.append(model)
 
     def filtered(cond, params):
         parts = [cond, *filter_cond]
@@ -930,7 +933,11 @@ class Handler(BaseHTTPRequestHandler):
             frm, to = parse_range(params)
             agent = params.get("agent", [""])[0].strip()
             upstream = params.get("upstream", [""])[0].strip()
-            self.send_json({"ok": True, **summary(frm, to, agent=agent or None, upstream=upstream or None)})
+            model = params.get("model", [""])[0].strip()
+            self.send_json({"ok": True, **summary(
+                frm, to, agent=agent or None, upstream=upstream or None,
+                model=model or None,
+            )})
         elif path == "/api/filters":
             token = self.headers.get("X-Token", "")
             if not check_token(token) and not share_ok:
