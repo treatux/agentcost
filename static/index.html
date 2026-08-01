@@ -187,7 +187,7 @@
 <script>
 const TOKEN_KEY = 'agentcost_token';
 const CURRENCY_KEY = 'agentcost_currency';
-let state = { from: '', to: '', fx: 7.1, agent: '', upstream: '', filters: { agents: [], upstreams: [] } };
+let state = { from: '', to: '', fx: 7.1, agent: '', upstream: '', readonly: false, filters: { agents: [], upstreams: [] } };
 let lastScanAt = null;
 
 function getCurrency() { return localStorage.getItem(CURRENCY_KEY) || 'cny'; }
@@ -477,6 +477,8 @@ async function api(url, opts = {}) {
   const token = localStorage.getItem(TOKEN_KEY);
   const headers = { ...(opts.headers || {}) };
   if (token) headers['X-Token'] = token;
+  const share = new URLSearchParams(window.location.search).get('token');
+  if (share) headers['X-Share-Token'] = share;
   const res = await fetch(url, { ...opts, headers });
   if (res.status === 401) { localStorage.removeItem(TOKEN_KEY); renderLogin(); throw new Error('未登录'); }
   return res.json();
@@ -532,13 +534,12 @@ function renderToolbar() {
         ${filterOptions(state.filters.upstreams || [], state.upstream, '全部上游')}
       </select>
       <div class="spacer"></div>
-      <button class="logout" id="exportBtn">⬇ 导出</button>
+      ${state.readonly ? '' : '<button class="logout" id="exportBtn">⬇ 导出</button>'}
       <select class="cur-select" id="curSel">
         <option value="cny" ${getCurrency() === 'cny' ? 'selected' : ''}>¥ 人民币</option>
         <option value="usd" ${getCurrency() === 'usd' ? 'selected' : ''}>$ 美元</option>
       </select>
-      <button class="logout" id="settingsBtn">⚙ 设置</button>
-      <button class="logout" id="logout">退出</button>
+      ${state.readonly ? '' : '<button class="logout" id="settingsBtn">⚙ 设置</button><button class="logout" id="logout">退出</button>'}
     </div>`;
 }
 
@@ -636,8 +637,10 @@ function render(el, d) {
 function bindToolbar() {
   document.getElementById('from').onchange = load;
   document.getElementById('to').onchange = load;
-  document.getElementById('logout').onclick = () => { localStorage.removeItem(TOKEN_KEY); renderLogin(); };
-  document.getElementById('exportBtn').onclick = () => {
+  const logout = document.getElementById('logout');
+  if (logout) logout.onclick = () => { localStorage.removeItem(TOKEN_KEY); renderLogin(); };
+  const exportBtn = document.getElementById('exportBtn');
+  if (exportBtn) exportBtn.onclick = () => {
     const q = new URLSearchParams();
     if (state.from) q.set('from', state.from);
     if (state.to) q.set('to', state.to);
@@ -656,7 +659,8 @@ function bindToolbar() {
       })
       .catch(e => alert('导出失败: ' + e.message));
   };
-  document.getElementById('settingsBtn').onclick = openSettings;
+  const settingsBtn = document.getElementById('settingsBtn');
+  if (settingsBtn) settingsBtn.onclick = openSettings;
   document.getElementById('curSel').onchange = (e) => {
     setCurrency(e.target.value);
     load();
@@ -688,7 +692,9 @@ async function load() {
     if (state.to) q.set('to', state.to);
     if (state.agent) q.set('agent', state.agent);
     if (state.upstream) q.set('upstream', state.upstream);
-    const [d, cfgResp] = await Promise.all([api('api/summary?' + q.toString()), api('api/config')]);
+    const requests = [api('api/summary?' + q.toString())];
+    if (!state.readonly) requests.push(api('api/config'));
+    const [d, cfgResp] = await Promise.all(requests);
     if (!d.ok) throw new Error(d.error || '加载失败');
     state.fx = d.fx || state.fx;
     state.budget = (cfgResp && cfgResp.config) || state.budget || {};
@@ -771,6 +777,9 @@ async function openSettings() {
       <div class="field"><label>数据接入 Key</label>
         <input type="text" id="cfgIngestKey" value="${cfg.ingest_key || ''}" placeholder="留空=仅允许登录 Token">
         <div class="hint">调用 POST /api/ingest 时可通过 X-Ingest-Key 认证</div></div>
+      <div class="field" style="border-top:1px solid var(--line);padding-top:16px"><label>只读分享</label>
+        <div class="hint">${cfg.share_enabled ? '已启用：任何拿到链接的人可只读查看，无修改权限' : '未启用'}</div>
+        <div style="display:flex;gap:8px;margin-top:8px"><input id="shareUrl" type="text" readonly value="${cfg.share_enabled && cfg.share_token ? location.origin + '/share/?token=' + cfg.share_token : ''}" placeholder="生成后显示分享链接" style="flex:1"><button id="shareCreate">生成链接</button><button id="shareCopy">复制</button><button id="shareRevoke">撤销</button></div></div>
       <div class="status" id="cfgStatus"></div>
       <div class="actions">
         <button id="cfgModels">📦 模型价格管理</button>
@@ -790,6 +799,14 @@ async function openSettings() {
     if (r.sent) { st.className = 'status ok'; st.textContent = '✅ 通知已发送，请查收'; }
     else { st.className = 'status err'; st.textContent = '❌ ' + (r.error || '发送失败'); }
   };
+  document.getElementById('shareCreate').onclick = async () => {
+    const r = await api('api/share/create');
+    if (r.ok) document.getElementById('shareUrl').value = location.origin + r.share_url;
+  };
+  document.getElementById('shareCopy').onclick = async () => {
+    const v = document.getElementById('shareUrl').value; if (v) await navigator.clipboard.writeText(v);
+  };
+  document.getElementById('shareRevoke').onclick = async () => { await api('api/share/revoke'); document.getElementById('shareUrl').value = ''; };
   document.getElementById('cfgSave').onclick = async () => {
     const st = document.getElementById('cfgStatus');
     const payload = {
@@ -913,7 +930,9 @@ async function openModelsManager() {
 
 async function init() {
   const token = localStorage.getItem(TOKEN_KEY);
-  if (!token) { renderLogin(); return; }
+  const share = new URLSearchParams(window.location.search).get('token');
+  state.readonly = !token && !!share;
+  if (!token && !share) { renderLogin(); return; }
   document.getElementById('root').innerHTML = '<div id="loading">加载中...</div>';
   try { await loadFilters(); } catch (e) { if (e.message === '未登录') return; }
   load();

@@ -66,6 +66,8 @@ DEFAULT_CONFIG = {
     "report_weekday": 1,          # 周报推送日：1=周一 ... 7=周日，0=每天
     "report_type": "daily",     # daily / weekly
     "ingest_key": "",             # 独立数据接入密钥；为空时仅允许登录 token
+    "share_enabled": False,
+    "share_token": "",
 }
 _config = dict(DEFAULT_CONFIG)
 _last_notify = {}  # level -> timestamp
@@ -404,6 +406,14 @@ def check_token(token):
         TOKENS.pop(token, None)
         return None
     return info["user"]
+
+
+def check_share_token(token):
+    """校验只读分享令牌。"""
+    configured = str(_config.get("share_token") or "")
+    if not configured or not _config.get("share_enabled") or not token:
+        return False
+    return hmac.compare_digest(configured, str(token))
 
 
 def query_db(sql, params=()):
@@ -806,6 +816,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         params = parse_qs(urlparse(self.path).query)
+        share_ok = (check_share_token(params.get("token", [""])[0]) or
+                    check_share_token(self.headers.get("X-Share-Token", "")))
 
         if path == "/api/health":
             records = 0
@@ -830,7 +842,7 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif path == "/api/summary":
             token = self.headers.get("X-Token", "")
-            if not check_token(token):
+            if not check_token(token) and not share_ok:
                 self.send_json({"ok": False, "error": "未登录"}, status=401)
                 return
             frm, to = parse_range(params)
@@ -839,7 +851,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": True, **summary(frm, to, agent=agent or None, upstream=upstream or None)})
         elif path == "/api/filters":
             token = self.headers.get("X-Token", "")
-            if not check_token(token):
+            if not check_token(token) and not share_ok:
                 self.send_json({"ok": False, "error": "未登录"}, status=401)
                 return
             rows = query_db("""
@@ -863,7 +875,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": True, "config": cfg})
         elif path == "/api/models":
             token = self.headers.get("X-Token", "")
-            if not check_token(token):
+            if not check_token(token) and not share_ok:
                 self.send_json({"ok": False, "error": "未登录"}, status=401)
                 return
             self.send_json({"ok": True, **model_catalog()})
@@ -874,6 +886,27 @@ class Handler(BaseHTTPRequestHandler):
                 return
             frm, to = parse_range(params)
             self.send_export_csv(frm, to)
+        elif path == "/api/share/create":
+            token = self.headers.get("X-Token", "")
+            if not check_token(token):
+                self.send_json({"ok": False, "error": "未登录"}, status=401)
+                return
+            share_token = secrets.token_urlsafe(16)
+            save_config({"share_enabled": True, "share_token": share_token})
+            self.send_json({"ok": True, "share_url": "/share/?token=" + share_token})
+        elif path == "/api/share/revoke":
+            token = self.headers.get("X-Token", "")
+            if not check_token(token):
+                self.send_json({"ok": False, "error": "未登录"}, status=401)
+                return
+            save_config({"share_enabled": False, "share_token": ""})
+            self.send_json({"ok": True})
+        elif path == "/share/" or path == "/share":
+            # 重定向到根路径（保留 ?token= 参数），保证页面内相对路径 api/... 正确解析
+            q = urlparse(self.path).query
+            self.send_response(302)
+            self.send_header("Location", "/" + ("?" + q if q else ""))
+            self.end_headers()
         elif path == "/" or path == "/index.html":
             self.send_file(os.path.join(STATIC_DIR, "index.html"))
         elif path.startswith("/static/"):

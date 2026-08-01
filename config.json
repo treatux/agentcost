@@ -10,5 +10,8 @@
   "report_time": "09:00",
   "report_weekday": 1,
   "report_type": "daily",
+  "ingest_key": "",
+  "share_enabled": true,
+  "share_token": "z2-Xnv-diOmNf8hEI-SqDA",
   "monthly_budget_usd": 250
 }
