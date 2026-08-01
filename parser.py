@@ -377,10 +377,15 @@ def build_db(records, db_path):
             cache_write_tokens INTEGER,
             reasoning_tokens INTEGER,
             total_tokens INTEGER,
-            cost_usd REAL
+            cost_usd REAL,
+            source TEXT DEFAULT 'parser'
         )
     """)
-    cur.execute("DELETE FROM usage_records")
+    # 兼容旧库：为已有表补充来源列；仅清理解析器写入的数据，保留 API 接入记录。
+    cols = {row[1] for row in cur.execute("PRAGMA table_info(usage_records)").fetchall()}
+    if "source" not in cols:
+        cur.execute("ALTER TABLE usage_records ADD COLUMN source TEXT DEFAULT 'parser'")
+    cur.execute("DELETE FROM usage_records WHERE source = 'parser' OR source IS NULL")
     for r in records:
         u = r.get("usage") or {}
         cur.execute("""
@@ -388,8 +393,8 @@ def build_db(records, db_path):
             (agent, ts, model, provider, upstream, base_url, billing_mode, price_in, price_out,
              cwd, originator,
              input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-             reasoning_tokens, total_tokens, cost_usd)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             reasoning_tokens, total_tokens, cost_usd, source)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             r.get("agent"),
             normalize_ts(r.get("ts")),
@@ -409,6 +414,7 @@ def build_db(records, db_path):
             u.get("reasoning_output_tokens", 0),
             r.get("total_tokens", 0),
             r.get("cost_usd"),
+            "parser",
         ))
     conn.commit()
     conn.close()

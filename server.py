@@ -52,6 +52,7 @@ DEFAULT_CONFIG = {
     "webhook_type": "generic",   # wecom / serverchan / dingtalk / generic
     "webhook_url": "",
     "notify_cooldown_hours": 12, # 同一告警等级 12 小时内不重复通知
+    "ingest_key": "",             # 独立数据接入密钥；为空时仅允许登录 token
 }
 _config = dict(DEFAULT_CONFIG)
 _last_notify = {}  # level -> timestamp
@@ -428,6 +429,81 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    def check_ingest_auth(self):
+        """接入 API 支持登录 token，或配置的独立 X-Ingest-Key。"""
+        if check_token(self.headers.get("X-Token", "")):
+            return True
+        ingest_key = str(_config.get("ingest_key") or "")
+        supplied = self.headers.get("X-Ingest-Key", "")
+        return bool(ingest_key and supplied and hmac.compare_digest(ingest_key, supplied))
+
+    def ingest(self, data):
+        """校验并批量写入 API 用量记录。"""
+        items = data if isinstance(data, list) else [data]
+        if not items or any(not isinstance(item, dict) for item in items):
+            self.send_json({"ok": False, "error": "请求体必须是对象或对象数组"}, status=400)
+            return
+
+        int_fields = ("input_tokens", "output_tokens", "cache_read_tokens",
+                      "cache_write_tokens", "reasoning_tokens", "total_tokens")
+        str_fields = ("agent", "model", "provider", "upstream", "base_url",
+                      "billing_mode", "cwd", "originator")
+        rows = []
+        for item in items:
+            model = item.get("model")
+            if model is None or not str(model).strip():
+                self.send_json({"ok": False, "error": "缺少模型名"}, status=400)
+                return
+            model = str(model).strip()
+            ts_value = item.get("ts")
+            if ts_value is None or ts_value == "":
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                try:
+                    ts_text = str(ts_value).replace("Z", "+00:00")
+                    dt = datetime.fromisoformat(ts_text)
+                    if dt.tzinfo:
+                        dt = dt.astimezone()
+                    ts = dt.strftime("%Y-%m-%d %H:%M:%S")
+                except (TypeError, ValueError):
+                    self.send_json({"ok": False, "error": "ts 必须是 ISO 时间字符串"}, status=400)
+                    return
+            values = {}
+            try:
+                for field in int_fields:
+                    value = item.get(field, 0)
+                    values[field] = 0 if value is None or value == "" else int(value)
+                cost = item.get("cost_usd", 0)
+                values["cost_usd"] = 0.0 if cost is None or cost == "" else float(cost)
+            except (TypeError, ValueError, OverflowError):
+                self.send_json({"ok": False, "error": "数字字段格式错误"}, status=400)
+                return
+            rows.append((
+                item.get("agent", ""), ts, model,
+                *(str(item.get(field, "") or "") for field in str_fields[2:]),
+                values["input_tokens"], values["output_tokens"],
+                values["cache_read_tokens"], values["cache_write_tokens"],
+                values["reasoning_tokens"], values["total_tokens"], values["cost_usd"], "api"
+            ))
+
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            cur = conn.cursor()
+            cols = {row[1] for row in cur.execute("PRAGMA table_info(usage_records)").fetchall()}
+            if "source" not in cols:
+                cur.execute("ALTER TABLE usage_records ADD COLUMN source TEXT DEFAULT 'parser'")
+            cur.executemany("""
+                INSERT INTO usage_records
+                (agent, ts, model, provider, upstream, base_url, billing_mode, price_in, price_out,
+                 cwd, originator, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                 reasoning_tokens, total_tokens, cost_usd, source)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, [row[:7] + (None, None) + row[7:] for row in rows])
+            conn.commit()
+        finally:
+            conn.close()
+        self.send_json({"ok": True, "inserted": len(rows)})
+
     def do_POST(self):
         if self.path == "/api/login":
             data = self.read_body()
@@ -439,6 +515,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "token": token, "user": username})
             else:
                 self.send_json({"ok": False, "error": "用户名或密码错误"}, status=401)
+        elif self.path == "/api/ingest":
+            if not self.check_ingest_auth():
+                self.send_json({"ok": False, "error": "未登录"}, status=401)
+                return
+            self.ingest(self.read_body())
         elif self.path == "/api/config":
             token = self.headers.get("X-Token", "")
             if not check_token(token):
@@ -584,6 +665,8 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     print(f"AgentCost v3 仪表盘: http://localhost:{PORT}")
     print(f"自动刷新: 每 {AUTO_REFRESH_SECONDS} 秒")
+    # 在接受请求前加载配置，确保独立接入 Key 立即生效。
+    load_config()
     # 启动自动刷新线程（守护线程，随主进程退出）
     threading.Thread(target=auto_refresh_loop, daemon=True).start()
     server = HTTPServer(("0.0.0.0", PORT), Handler)

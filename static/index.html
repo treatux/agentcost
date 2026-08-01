@@ -618,6 +618,9 @@ async function openSettings() {
         <input type="text" id="cfgWurl" value="${cfg.webhook_url || ''}" placeholder="https://qyapi.weixin.qq.com/... 或 Server酱 KEY">
         <div class="hint">企业微信/钉钉: 机器人 Webhook 地址；Server酱: SendKey（URL 或裸 key 均可）</div></div>
       <div class="field"><label><input type="checkbox" id="cfgWenabled" ${cfg.webhook_enabled ? 'checked' : ''} style="width:auto;margin-right:6px">启用 Webhook 告警</label></div>
+      <div class="field"><label>数据接入 Key</label>
+        <input type="text" id="cfgIngestKey" value="${cfg.ingest_key || ''}" placeholder="留空=仅允许登录 Token">
+        <div class="hint">调用 POST /api/ingest 时可通过 X-Ingest-Key 认证</div></div>
       <div class="status" id="cfgStatus"></div>
       <div class="actions">
         <button id="cfgModels">📦 模型价格管理</button>
@@ -647,6 +650,7 @@ async function openSettings() {
       webhook_type: document.getElementById('cfgWtype').value,
       webhook_url: document.getElementById('cfgWurl').value.trim(),
       webhook_enabled: document.getElementById('cfgWenabled').checked,
+      ingest_key: document.getElementById('cfgIngestKey').value.trim(),
     };
     try {
       const r = await api('api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
