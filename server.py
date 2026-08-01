@@ -300,7 +300,7 @@ def parse_range(params):
     return frm, to
 
 
-def summary(frm, to):
+def summary(frm, to, agent=None, upstream=None):
     """范围汇总。"""
     def agg(cond, params):
         r = query_db(f"""
@@ -311,10 +311,25 @@ def summary(frm, to):
         """, params)[0]
         return r
 
+    # 所有汇总都复用同一组可选筛选条件，保证范围、预测和环比口径一致。
+    filter_cond = []
+    filter_params = []
+    if agent:
+        filter_cond.append("agent = ?")
+        filter_params.append(agent)
+    if upstream:
+        filter_cond.append("upstream = ?")
+        filter_params.append(upstream)
+
+    def filtered(cond, params):
+        parts = [cond, *filter_cond]
+        return " AND ".join(parts), tuple(params) + tuple(filter_params)
+
     # 范围 = ts >= frm 且 ts <= to+1天
     to_next = (datetime.strptime(to, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
     base_cond = "ts >= ? AND ts < ?"
     base_params = (frm, to_next)
+    range_cond, range_params = filtered(base_cond, base_params)
 
     fx = fetch_fx_rate()
 
@@ -354,7 +369,7 @@ def summary(frm, to):
             m["cache_price_write"] = None
         return m
 
-    total = agg(base_cond, base_params)
+    total = agg(range_cond, range_params)
     total["saved_usd"] = 0
 
     # 月底预测：本月已用成本 / 已过天数 × 本月总天数（金额均为 USD）。
@@ -364,7 +379,8 @@ def summary(frm, to):
     month_start = month_start_dt.strftime("%Y-%m-%d")
     # 截止今天（含今天），避免未来日期记录影响“已用”。
     today_exclusive = (now.date() + timedelta(days=1)).strftime("%Y-%m-%d")
-    month_used = agg("ts >= ? AND ts < ?", (month_start, today_exclusive))["cost"] or 0
+    month_cond, month_params = filtered("ts >= ? AND ts < ?", (month_start, today_exclusive))
+    month_used = agg(month_cond, month_params)["cost"] or 0
     days_elapsed = now.day
     days_total = (next_month_dt - month_start_dt).days
     month_avg = month_used / days_elapsed if days_elapsed else 0
@@ -384,23 +400,31 @@ def summary(frm, to):
     prev_to_dt = to_dt - timedelta(days=range_days)
     prev_from = prev_from_dt.strftime("%Y-%m-%d")
     prev_to = prev_to_dt.strftime("%Y-%m-%d")
-    prev = agg("ts >= ? AND ts < ?", (prev_from, (prev_to_dt + timedelta(days=1)).strftime("%Y-%m-%d")))
+    prev_cond, prev_params = filtered(
+        "ts >= ? AND ts < ?",
+        (prev_from, (prev_to_dt + timedelta(days=1)).strftime("%Y-%m-%d")),
+    )
+    prev = agg(prev_cond, prev_params)
     prev.update({"from": prev_from, "to": prev_to})
     by_agent = query_db(f"""
         SELECT agent, COUNT(*) as cnt, SUM(total_tokens) as tokens, SUM(cost_usd) as cost
-        FROM usage_records WHERE {base_cond} GROUP BY agent
-    """, base_params)
+        FROM usage_records WHERE {range_cond} GROUP BY agent
+    """, range_params)
     by_model = query_db(f"""
         SELECT model, upstream, billing_mode, price_in, price_out,
                COUNT(*) as cnt, SUM(total_tokens) as tokens, SUM(cost_usd) as cost,
                SUM(input_tokens) as inp_tokens, SUM(output_tokens) as out_tokens,
-               SUM(cache_read_tokens) as cr_tokens, SUM(cache_write_tokens) as cw_tokens
-        FROM usage_records WHERE {base_cond} GROUP BY model, upstream ORDER BY tokens DESC
-    """, base_params)
+               SUM(cache_read_tokens) as cr_tokens, SUM(cache_write_tokens) as cw_tokens,
+               SUM(reasoning_tokens) as reasoning_tokens
+        FROM usage_records WHERE {range_cond} GROUP BY model, upstream ORDER BY tokens DESC
+    """, range_params)
     daily = query_db(f"""
-        SELECT substr(ts,1,10) as day, COUNT(*) as cnt, SUM(total_tokens) as tokens, SUM(cost_usd) as cost
-        FROM usage_records WHERE {base_cond} GROUP BY day ORDER BY day
-    """, base_params)
+        SELECT substr(ts,1,10) as day, COUNT(*) as cnt, SUM(total_tokens) as tokens, SUM(cost_usd) as cost,
+               SUM(input_tokens) as inp, SUM(output_tokens) as out,
+               SUM(cache_read_tokens) as cr, SUM(cache_write_tokens) as cw,
+               SUM(reasoning_tokens) as reasoning
+        FROM usage_records WHERE {range_cond} GROUP BY day ORDER BY day
+    """, range_params)
 
     # 缓存节省：若无缓存，缓存读 token 按输入价计费；实际按缓存读价计费。
     for m in by_model:
@@ -685,7 +709,22 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "未登录"}, status=401)
                 return
             frm, to = parse_range(params)
-            self.send_json({"ok": True, **summary(frm, to)})
+            agent = params.get("agent", [""])[0].strip()
+            upstream = params.get("upstream", [""])[0].strip()
+            self.send_json({"ok": True, **summary(frm, to, agent=agent or None, upstream=upstream or None)})
+        elif path == "/api/filters":
+            token = self.headers.get("X-Token", "")
+            if not check_token(token):
+                self.send_json({"ok": False, "error": "未登录"}, status=401)
+                return
+            rows = query_db("""
+                SELECT DISTINCT agent, upstream FROM usage_records
+                WHERE (agent IS NOT NULL AND agent != '')
+                   OR (upstream IS NOT NULL AND upstream != '')
+            """)
+            agents = sorted({row["agent"] for row in rows if row["agent"]})
+            upstreams = sorted({row["upstream"] for row in rows if row["upstream"]})
+            self.send_json({"ok": True, "agents": agents, "upstreams": upstreams})
         elif path == "/api/config":
             token = self.headers.get("X-Token", "")
             if not check_token(token):

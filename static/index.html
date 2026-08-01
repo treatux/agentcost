@@ -84,7 +84,7 @@
     .toolbar input[type="date"] { padding: 7px 8px; font-size: 12px; flex: 1; min-width: 0; }
     .quick { flex-wrap: wrap; }
     .quick button { padding: 6px 10px; font-size: 12px; }
-    .cur-select { padding: 6px 8px; font-size: 12px; }
+    .cur-select { padding: 6px 8px; font-size: 12px; flex: 1; min-width: 0; }
     .logout { padding: 6px 6px; font-size: 12px; }
     .panel { padding: 16px 12px; border-radius: 12px; margin-bottom: 10px; }
     h2 { font-size: 14px; margin-bottom: 10px; }
@@ -187,7 +187,7 @@
 <script>
 const TOKEN_KEY = 'agentcost_token';
 const CURRENCY_KEY = 'agentcost_currency';
-let state = { from: '', to: '', fx: 7.1 };
+let state = { from: '', to: '', fx: 7.1, agent: '', upstream: '', filters: { agents: [], upstreams: [] } };
 
 function getCurrency() { return localStorage.getItem(CURRENCY_KEY) || 'cny'; }
 function setCurrency(c) { localStorage.setItem(CURRENCY_KEY, c); }
@@ -251,6 +251,26 @@ function bindChartHover() {
           t = `<div class="tip-t">${d.day}</div><div>${label}: <span class="tip-v">${valTxt}</span></div>`;
         }
       }
+      // 堆叠图的所有层共用按 X 轴取最近日期的明细提示。
+      if (el.classList.contains('stack-hit')) {
+        const daily = JSON.parse(el.getAttribute('data-daily') || '[]');
+        if (daily.length) {
+          const svg = el.closest('svg');
+          const rect = svg.getBoundingClientRect();
+          const vb = svg.viewBox.baseVal;
+          const xRatio = (e.clientX - rect.left) / rect.width * vb.width;
+          const PL = 64, iw = vb.width - 64 - 20;
+          const idx = Math.max(0, Math.min(daily.length - 1, Math.round((xRatio - PL) / (iw / Math.max(1, daily.length - 1)))));
+          const d = daily[idx];
+          t = `<div class="tip-t">${d.day}</div>` +
+            `<div>输入: <span class="tip-v">${fmtTokens(d.inp || 0)}</span></div>` +
+            `<div>输出: <span class="tip-v">${fmtTokens(d.out || 0)}</span></div>` +
+            `<div>缓存读: <span class="tip-v">${fmtTokens(d.cr || 0)}</span></div>` +
+            `<div>缓存写: <span class="tip-v">${fmtTokens(d.cw || 0)}</span></div>` +
+            `<div>推理: <span class="tip-v">${fmtTokens(d.reasoning || 0)}</span></div>` +
+            `<div>总 token: <span class="tip-v">${fmtTokens(d.tokens || 0)}</span></div>`;
+        }
+      }
       if (!t) return;
       tip.innerHTML = t;
       tip.style.opacity = '1';
@@ -306,6 +326,44 @@ function svgLineChart(daily, dim = 'tokens') {
     ${dots}
     ${labels}
   </svg></div>`;
+}
+
+function svgStackChart(daily) {
+  if (!daily || daily.length === 0) return '<div class="muted" style="padding:30px 0;text-align:center">范围内无数据</div>';
+  const W = 1000, H = 300, PL = 64, PR = 20, PT = 24, PB = 44;
+  const iw = W - PL - PR, ih = H - PT - PB;
+  const layers = [
+    ['inp', '输入', '#f0c4a8'], ['out', '输出', '#d97757'], ['cw', '缓存写', '#c05f3f'],
+    ['cr', '缓存读', '#e8a08a'], ['reasoning', '推理', '#9a6b3f']
+  ];
+  const sums = daily.map(d => layers.reduce((sum, [key]) => sum + (d[key] || 0), 0));
+  const max = Math.max(...sums, 1);
+  const n = daily.length, stepX = n > 1 ? iw / (n - 1) : 0;
+  const px = i => PL + i * stepX;
+  const py = v => PT + ih - (v / max) * ih;
+  const dailyJson = JSON.stringify(daily).replace(/'/g, '&#39;');
+  let grid = '', labels = '', paths = '';
+  for (let g = 0; g <= 4; g++) {
+    const y = PT + ih - (g / 4) * ih;
+    grid += `<line x1="${PL}" y1="${y}" x2="${W - PR}" y2="${y}" stroke="#e4e2db" stroke-width="1"/>`;
+    grid += `<text x="${PL - 8}" y="${y + 3}" text-anchor="end" font-size="11" fill="#8a8a85">${fmtTokens(max * g / 4)}</text>`;
+  }
+  daily.forEach((d, i) => {
+    if (n <= 15 || i % Math.ceil(n / 12) === 0 || i === n - 1) {
+      labels += `<text x="${px(i).toFixed(1)}" y="${H - 14}" text-anchor="middle" font-size="11" fill="#8a8a85">${d.day.slice(5)}</text>`;
+    }
+  });
+  let lower = Array(n).fill(0);
+  layers.forEach(([key, label, color]) => {
+    const upper = lower.map((v, i) => v + (daily[i][key] || 0));
+    let path = `M ${px(0).toFixed(1)} ${py(upper[0]).toFixed(1)} `;
+    upper.forEach((v, i) => { if (i) path += `L ${px(i).toFixed(1)} ${py(v).toFixed(1)} `; });
+    for (let i = n - 1; i >= 0; i--) path += `L ${px(i).toFixed(1)} ${py(lower[i]).toFixed(1)} `;
+    path += 'Z';
+    paths += `<path class="hoverable stack-hit" data-daily='${dailyJson}' d="${path}" fill="${color}" fill-opacity=".9" stroke="#fff" stroke-width=".7"><title>${label}</title></path>`;
+    lower = upper;
+  });
+  return `<div class="chart-box"><svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto" role="img">${grid}${paths}${labels}</svg></div>`;
 }
 
 function svgBarChart(models, dim = 'tokens') {
@@ -441,6 +499,8 @@ async function doLogin() {
 }
 
 function renderToolbar() {
+  const filterOptions = (items, selected, allLabel) =>
+    `<option value="">${allLabel}</option>${items.map(item => `<option value="${item}" ${item === selected ? 'selected' : ''}>${item}</option>`).join('')}`;
   return `
     <div class="toolbar">
       <label>从</label>
@@ -453,6 +513,12 @@ function renderToolbar() {
         <button data-month="1">本月</button>
         <button data-all="1">全部</button>
       </div>
+      <select class="cur-select" id="filterAgent" aria-label="Agent 筛选">
+        ${filterOptions(state.filters.agents || [], state.agent, '全部 Agent')}
+      </select>
+      <select class="cur-select" id="filterUp" aria-label="上游筛选">
+        ${filterOptions(state.filters.upstreams || [], state.upstream, '全部上游')}
+      </select>
       <div class="spacer"></div>
       <button class="logout" id="exportBtn">⬇ 导出</button>
       <select class="cur-select" id="curSel">
@@ -492,7 +558,7 @@ function render(el, d) {
   const agentTags = { codex: 'codex', hermes: 'hermes', claude: 'claude' };
   const byAgentHtml = d.by_agent.map(a => `
     <tr><td><span class="tag tag-${agentTags[a.agent] || 'codex'}">${a.agent}</span></td>
-    <td class="num">${fmtTokens(a.tokens)}</td><td class="num">${fmtCost(a.cost)}</td></tr>`).join('');
+    <td class="num">${a.cnt || 0}</td><td class="num">${fmtTokens(a.tokens)}</td><td class="num">${fmtCost(a.cost)}</td></tr>`).join('');
   const maxModel = Math.max(...d.by_model.map(m => m.tokens), 1);
   const upstreamNames = { wanlai: 'Wanlai', sub2api: 'sub2api', omniroute: 'OmniRoute', deepseek: 'DeepSeek', nvidia: 'NVIDIA', custom: '自定义', auto: '自动', anthropic: 'Anthropic', openai: 'OpenAI' };
   const byModelHtml = d.by_model.map(m => {
@@ -526,6 +592,7 @@ function render(el, d) {
   window.__donutData = d.by_model.map(m => ({label: m.model || 'unknown', cost: m.cost || 0, tokens: m.tokens || 0, cnt: m.cnt || 0}));
   window.__lineData = d.daily;
   const lineChart = svgLineChart(d.daily, 'tokens');
+  const stackChart = svgStackChart(window.__lineData);
   const barChart = svgBarChart(d.by_model.slice(0, 10), 'tokens');
   const donutChart = svgDonutChart(window.__donutData, 'cost');
 
@@ -541,10 +608,11 @@ function render(el, d) {
       <div class="panel" id="barPanel"><h2>模型对比 (Top 10)</h2>${chartTabs('barTabs', 'tokens')}<div class="chart-note">悬停柱子查看详情</div>${barChart}</div>
       <div class="panel" id="donutPanel"><h2>成本分布</h2>${chartTabs('donutTabs', 'cost')}<div class="chart-note">按模型占比</div>${donutChart}</div>
       <div class="grid2">
-        <div class="panel"><h2>按 Agent</h2><div class="scroll-box"><table><tr><th>来源</th><th>Tokens</th><th>成本</th></tr>${byAgentHtml}</table></div></div>
+        <div class="panel"><h2>按 Agent</h2><div class="scroll-box"><table><tr><th>来源</th><th>请求数</th><th>Tokens</th><th>成本</th></tr>${byAgentHtml}</table></div></div>
         <div class="panel"><h2>按模型</h2><div class="scroll-box"><table><tr><th>模型</th><th>上游</th><th>计费</th><th>价格(入/出)</th><th>缓存率·价</th><th></th><th>Tokens</th><th>成本</th><th>缓存节省</th></tr>${byModelHtml}</table></div></div>
       </div>
       <div class="panel" id="linePanel"><h2>每日趋势</h2>${chartTabs('lineTabs', 'tokens')}<div class="chart-note">悬停数据点查看详情</div>${lineChart}<table><tr><th>日期</th><th></th><th>Tokens</th><th>成本</th></tr>${dailyHtml || '<tr><td colspan="4" class="muted">范围内无数据</td></tr>'}</table></div>
+      <div class="panel" id="stackPanel"><h2>Token 结构</h2><div class="chart-note">输入、输出、缓存与推理 Token 的每日堆叠趋势；悬停查看明细</div>${stackChart}</div>
     </div>`;
   bindToolbar();
   bindChartHover();
@@ -579,6 +647,8 @@ function bindToolbar() {
     setCurrency(e.target.value);
     load();
   };
+  document.getElementById('filterAgent').onchange = (e) => { state.agent = e.target.value; load(); };
+  document.getElementById('filterUp').onchange = (e) => { state.upstream = e.target.value; load(); };
   document.querySelectorAll('.quick button').forEach(b => {
     b.onclick = () => {
       const f = document.getElementById('from'); const t = document.getElementById('to');
@@ -594,16 +664,28 @@ async function load() {
   const el = document.getElementById('root');
   const f = document.getElementById('from'); const t = document.getElementById('to');
   state.from = f ? f.value : state.from; state.to = t ? t.value : state.to;
+  const filterAgent = document.getElementById('filterAgent');
+  const filterUp = document.getElementById('filterUp');
+  state.agent = filterAgent ? filterAgent.value : state.agent;
+  state.upstream = filterUp ? filterUp.value : state.upstream;
   try {
     const q = new URLSearchParams();
     if (state.from) q.set('from', state.from);
     if (state.to) q.set('to', state.to);
+    if (state.agent) q.set('agent', state.agent);
+    if (state.upstream) q.set('upstream', state.upstream);
     const [d, cfgResp] = await Promise.all([api('api/summary?' + q.toString()), api('api/config')]);
     if (!d.ok) throw new Error(d.error || '加载失败');
     state.fx = d.fx || state.fx;
     state.budget = (cfgResp && cfgResp.config) || state.budget || {};
     render(el, d);
   } catch (e) { if (e.message !== '未登录') el.innerHTML = '<div class="err-msg">加载失败: ' + e.message + '</div>'; }
+}
+
+async function loadFilters() {
+  const r = await api('api/filters');
+  if (!r.ok) throw new Error(r.error || '加载筛选项失败');
+  state.filters = { agents: r.agents || [], upstreams: r.upstreams || [] };
 }
 
 /* ---------- 设置弹窗 ---------- */
@@ -788,10 +870,11 @@ async function openModelsManager() {
   };
 }
 
-function init() {
+async function init() {
   const token = localStorage.getItem(TOKEN_KEY);
   if (!token) { renderLogin(); return; }
   document.getElementById('root').innerHTML = '<div id="loading">加载中...</div>';
+  try { await loadFilters(); } catch (e) { if (e.message === '未登录') return; }
   load();
 }
 init();
