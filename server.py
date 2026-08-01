@@ -499,9 +499,15 @@ def summary(frm, to, agent=None, upstream=None, model=None):
         r = query_db(f"""
             SELECT COUNT(*) as cnt,
                    COALESCE(SUM(total_tokens),0) as tokens,
-                   COALESCE(SUM(cost_usd),0) as cost
+                   COALESCE(SUM(cost_usd),0) as cost,
+                   COALESCE(SUM(input_tokens),0) as inp_tokens,
+                   COALESCE(SUM(cache_read_tokens),0) as cr_tokens,
+                   COALESCE(SUM(cache_write_tokens),0) as cw_tokens
             FROM usage_records WHERE {cond}
         """, params)[0]
+        # 平均缓存率 = 缓存读 / (新输入 + 缓存读 + 缓存写)
+        total_in = r["inp_tokens"] + r["cr_tokens"] + r["cw_tokens"]
+        r["cache_rate"] = round(r["cr_tokens"] / total_in * 100, 1) if total_in else 0
         return r
 
     # 所有汇总都复用同一组可选筛选条件，保证范围、预测和环比口径一致。

@@ -565,6 +565,7 @@ function render(el, d) {
     { label: 'TOKENS 总量', value: fmtTokens(t.tokens), sub: fmtCost(t.cost) },
     { label: '估算成本', value: fmtCost(t.cost), sub: t.cnt + ' 条记录' },
     { label: '缓存节省', value: t.saved_usd ? fmtCost(t.saved_usd) : '—', sub: '省下的钱' },
+    { label: '平均缓存率', value: t.cache_rate != null ? t.cache_rate.toFixed(1) + '%' : '—', sub: t.cr_tokens ? '缓存读 ' + fmtTokens(t.cr_tokens) : '无缓存数据' },
     { label: '日均', value: fmtTokens(t.tokens / days), sub: fmtCost(t.cost / days) + ' / 天' },
     { label: '月底预测', value: forecast.used ? fmtCost(forecast.forecast) : '—', sub: forecast.used ? `已用 ${forecast.days_elapsed} 天 · 日均 ${fmtCost(forecast.avg)}` : '—' },
     { label: '环比', value: prevPct == null ? '—' : `<span style="color:${prevColor}">${prevPct >= 0 ? '+' : ''}${prevPct.toFixed(1)}%</span>`, sub: 'vs 上一段' },
