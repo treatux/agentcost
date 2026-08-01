@@ -18,6 +18,7 @@ import hmac
 import subprocess
 import threading
 import urllib.request
+import shutil
 import parser as cost_parser
 from datetime import datetime, timedelta
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -39,6 +40,8 @@ HOST = os.environ.get("AGENTCOST_HOST", "127.0.0.1")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 AUTO_REFRESH_SECONDS = int(os.environ.get("AGENTCOST_REFRESH_SECONDS", "300"))  # 默认每 5 分钟自动刷新
 _last_price_fetch_date = None
+_last_backup_date = None
+_backup_lock = threading.Lock()
 
 
 def get_conn():
@@ -86,11 +89,107 @@ DEFAULT_CONFIG = {
     "share_token": "",
     "share_user": "",
     "share_role": "",
+    "backup_dir": os.path.join(DB_DIR, "backups"),
 }
 _config = dict(DEFAULT_CONFIG)
 _last_notify = {}  # level -> timestamp
 _last_anomaly_notify = {}  # anomaly level -> timestamp
 _last_report_date = None  # YYYY-MM-DD，仅在当前进程内防止同日重复推送
+
+
+def backup_dir():
+    """返回配置的备份目录；相对路径以数据目录为基准。"""
+    configured = str(_config.get("backup_dir") or os.path.join(DB_DIR, "backups"))
+    if not os.path.isabs(configured):
+        configured = os.path.join(DB_DIR, configured)
+    return os.path.realpath(configured)
+
+
+def list_backups():
+    """列出当前备份目录中的常规文件，按最新修改时间在前。"""
+    root = backup_dir()
+    if not os.path.isdir(root):
+        return []
+    files = []
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        if os.path.isfile(path):
+            stat = os.stat(path)
+            files.append({"name": name, "size": stat.st_size, "mtime": stat.st_mtime})
+    return sorted(files, key=lambda item: item["mtime"], reverse=True)
+
+
+def create_backup():
+    """用 SQLite backup API 创建当日数据库和配置快照，并只保留最近 7 天。"""
+    root = backup_dir()
+    date = datetime.now().strftime("%Y%m%d")
+    db_name = f"agentcost-{date}.db"
+    os.makedirs(root, exist_ok=True)
+    with _backup_lock:
+        target = os.path.join(root, db_name)
+        source = get_conn()
+        destination = sqlite3.connect(target, timeout=5)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+            source.close()
+
+        # 首次运行尚未有 config.json 时，也让备份包含可恢复的默认配置。
+        if not os.path.isfile(CONFIG_PATH):
+            save_config(_config)
+        # 配置快照与同日数据库放在一起。不存在的可选文件直接跳过。
+        config_files = (
+            (USERS_PATH, "users"),
+            (CONFIG_PATH, "config"),
+            (OVERRIDE_PATH, "models_override"),
+            (getattr(cost_parser, "OFFICIAL_PRICES_PATH", ""), "official_prices"),
+        )
+        for source_path, label in config_files:
+            if source_path and os.path.isfile(source_path):
+                shutil.copy2(source_path, os.path.join(root, f"{label}-{date}.json"))
+
+        # 以数据库快照日期作为一份备份的边界，连同该日期的配置文件一起删除。
+        dates = sorted(
+            name[len("agentcost-"):-len(".db")]
+            for name in os.listdir(root)
+            if name.startswith("agentcost-") and name.endswith(".db")
+            and len(name) == len("agentcost-YYYYMMDD.db") and name[10:18].isdigit()
+        )
+        for old_date in dates[:-7]:
+            for name in os.listdir(root):
+                if name == f"agentcost-{old_date}.db" or name.endswith(f"-{old_date}.json"):
+                    old_path = os.path.join(root, name)
+                    if os.path.isfile(old_path):
+                        os.remove(old_path)
+    return db_name
+
+
+def alert_in_cooldown(alert_type, level, now_iso):
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            """SELECT 1 FROM alert_history WHERE type = ? AND level = ?
+               AND cooldown_until > ? ORDER BY id DESC LIMIT 1""",
+            (alert_type, level, now_iso),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def record_alert(alert_type, level, message, cooldown_seconds):
+    now = datetime.now().astimezone()
+    conn = get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO alert_history (ts, level, type, message, cooldown_until) VALUES (?, ?, ?, ?, ?)",
+            (now.isoformat(timespec="seconds"), level, alert_type, message,
+             (now + timedelta(seconds=cooldown_seconds)).isoformat(timespec="seconds")),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def load_config():
@@ -241,6 +340,7 @@ def check_budget_and_notify():
         pct = cost_usd / budget_usd * 100
         threshold = _config.get("alert_threshold", 0.8) * 100
         now = time.time()
+        now_iso = datetime.now().astimezone().isoformat(timespec="seconds")
 
         level = None
         if cost_usd >= budget_usd:
@@ -251,9 +351,8 @@ def check_budget_and_notify():
         if level is None:
             return
         # 冷却期检查
-        last = _last_notify.get(level, 0)
         cooldown = _config.get("notify_cooldown_hours", 12) * 3600
-        if now - last < cooldown:
+        if alert_in_cooldown("budget", level, now_iso):
             return
         _last_notify[level] = now
         # 显示用：按预算货币显示金额
@@ -265,6 +364,8 @@ def check_budget_and_notify():
                 f"本月已用: {cur_text}\n"
                 f"使用率: {pct:.1f}%")
         send_webhook(text)
+        # 无论 webhook 成功与否都保留本次尝试，供审计和跨重启冷却使用。
+        record_alert("budget", level, text, cooldown)
     except Exception as e:
         print(f"[budget] 检查失败: {e}")
 
@@ -300,9 +401,10 @@ def check_anomaly_and_notify():
             return
 
         now = time.time()
+        now_iso = datetime.now().astimezone().isoformat(timespec="seconds")
         cooldown = float(_config.get("anomaly_cooldown_hours", 24) or 24) * 3600
-        level = "anomaly"
-        if now - _last_anomaly_notify.get(level, 0) < cooldown:
+        level = "warn"
+        if alert_in_cooldown("anomaly", level, now_iso):
             return
         _last_anomaly_notify[level] = now
 
@@ -319,6 +421,7 @@ def check_anomaly_and_notify():
                 f"近7天日均: {avg_text}\n"
                 f"超出倍数: {cost_today / cost_avg:.1f}倍")
         send_webhook(text)
+        record_alert("anomaly", level, text, cooldown)
     except Exception as e:
         print(f"[anomaly] 检查失败: {e}")
 
@@ -461,9 +564,17 @@ def maybe_fetch_official_prices():
 
 def auto_refresh_loop():
     """后台线程：启动时刷一次，之后每 5 分钟刷一次；每次刷新后检查预算。"""
+    global _last_backup_date
     maybe_fetch_official_prices()
     run_parser()
     load_config()
+    today = datetime.now().date().isoformat()
+    if _last_backup_date != today:
+        try:
+            create_backup()
+            _last_backup_date = today
+        except Exception as e:
+            print(f"[backup] 自动备份失败: {e}")
     check_budget_and_notify()
     check_anomaly_and_notify()
     while True:
@@ -471,6 +582,10 @@ def auto_refresh_loop():
         try:
             maybe_fetch_official_prices()
             run_parser()
+            today = datetime.now().date().isoformat()
+            if _last_backup_date != today:
+                create_backup()
+                _last_backup_date = today
             check_budget_and_notify()
             check_anomaly_and_notify()
             check_scheduled_report()
@@ -665,6 +780,25 @@ def ensure_usage_schema():
         conn.commit()
     except sqlite3.Error:
         pass
+    finally:
+        conn.close()
+
+
+def ensure_schema():
+    """建立独立于用量表的持久化告警历史。"""
+    conn = get_conn()
+    try:
+        conn.execute("""CREATE TABLE IF NOT EXISTS alert_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            level TEXT NOT NULL,
+            type TEXT NOT NULL,
+            message TEXT NOT NULL,
+            cooldown_until TEXT NOT NULL
+        )""")
+        conn.execute("""CREATE INDEX IF NOT EXISTS idx_alert_history_cooldown
+                        ON alert_history(type, level, cooldown_until)""")
+        conn.commit()
     finally:
         conn.close()
 
@@ -924,6 +1058,26 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_backup_file(self, name):
+        """下载备份文件；文件名必须解析到当前备份目录内。"""
+        root = backup_dir()
+        candidate = os.path.realpath(os.path.join(root, name))
+        try:
+            inside_backup = os.path.commonpath((root, candidate)) == root
+        except ValueError:
+            inside_backup = False
+        if not inside_backup or os.path.basename(candidate) != name or not os.path.isfile(candidate):
+            self.send_json({"ok": False, "error": "备份文件不存在"}, status=404)
+            return
+        with open(candidate, "rb") as f:
+            body = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def read_body(self):
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
@@ -1121,6 +1275,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "config": cfg})
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, status=400)
+        elif self.path == "/api/backups":
+            info = get_token_info(self.headers.get("X-Token", ""))
+            if not info:
+                self.send_json({"ok": False, "error": "未登录"}, status=401)
+                return
+            if info["role"] != "admin":
+                self.send_json({"ok": False, "error": "无权限"}, status=403)
+                return
+            try:
+                name = create_backup()
+                self.send_json({"ok": True, "file": name})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, status=500)
         elif self.path == "/api/test-webhook":
             token = self.headers.get("X-Token", "")
             if not check_token(token):
@@ -1354,6 +1521,29 @@ class Handler(BaseHTTPRequestHandler):
                 cfg["webhook_url_masked"] = cfg["webhook_url"][:30] + "..." if len(cfg["webhook_url"]) > 30 else cfg["webhook_url"]
             cfg["fx"] = fetch_fx_rate()
             self.send_json({"ok": True, "config": cfg})
+        elif path == "/api/backups":
+            if not token_info:
+                self.send_json({"ok": False, "error": "未登录"}, status=401)
+                return
+            if token_info["role"] != "admin":
+                self.send_json({"ok": False, "error": "无权限"}, status=403)
+                return
+            self.send_json({"ok": True, "backup_dir": backup_dir(), "files": list_backups()})
+        elif path == "/api/backups/download":
+            if not token_info:
+                self.send_json({"ok": False, "error": "未登录"}, status=401)
+                return
+            if token_info["role"] != "admin":
+                self.send_json({"ok": False, "error": "无权限"}, status=403)
+                return
+            self.send_backup_file(params.get("name", [""])[0])
+        elif path == "/api/alerts":
+            if not token_info:
+                self.send_json({"ok": False, "error": "未登录"}, status=401)
+                return
+            self.send_json({"ok": True, "alerts": query_db(
+                "SELECT ts, level, type, message FROM alert_history ORDER BY id DESC LIMIT 50"
+            )})
         elif path == "/api/models":
             identity = token_info or share_info
             if not identity:
@@ -1452,6 +1642,7 @@ def main():
     load_config()
     load_users()
     ensure_usage_schema()
+    ensure_schema()
     # 启动自动刷新线程（守护线程，随主进程退出）
     threading.Thread(target=auto_refresh_loop, daemon=True).start()
     server = ThreadingHTTPServer((HOST, PORT), Handler)

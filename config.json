@@ -13,9 +13,10 @@
   "report_time": "09:00",
   "report_weekday": 1,
   "report_type": "daily",
-  "ingest_key": "agentcost-client-local-test-key",
+  "ingest_key": "",
   "share_enabled": false,
   "share_token": "",
   "share_user": "",
-  "share_role": ""
+  "share_role": "",
+  "backup_dir": "/root/agentcost/backups"
 }

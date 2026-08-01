@@ -801,6 +801,8 @@ async function openSettings() {
   let cfg = {};
   let users = [];
   let officialPrices = { fetched_at: '', count: 0 };
+  let alerts = [];
+  let backups = { backup_dir: '', files: [] };
   try {
     const r = await api('api/config');
     cfg = r.config || {};
@@ -809,11 +811,19 @@ async function openSettings() {
     const r = await api('api/prices');
     if (r.ok) officialPrices = r;
   } catch (e) { /* 价格缓存不可用时仍可打开设置 */ }
+  try {
+    const r = await api('api/alerts');
+    if (r.ok) alerts = r.alerts || [];
+  } catch (e) { /* 告警历史不可用时仍可打开设置 */ }
   if (state.role === 'admin' && !state.readonly) {
     try {
       const r = await api('api/users');
       if (r.ok) users = r.users || [];
     } catch (e) { /* 添加操作会显示具体错误 */ }
+    try {
+      const r = await api('api/backups');
+      if (r.ok) backups = r;
+    } catch (e) { /* 备份不可用时仍可打开设置 */ }
   }
   const mask = document.createElement('div');
   mask.className = 'modal-mask';
@@ -824,6 +834,8 @@ async function openSettings() {
   const officialUpdated = officialPrices.fetched_at
     ? new Date(officialPrices.fetched_at).toLocaleString()
     : '尚未更新';
+  const alertRows = alerts.slice(0, 20).map(item => `<tr><td>${escHtml(new Date(item.ts).toLocaleString())}</td><td>${escHtml(item.level)}</td><td>${escHtml(item.type)}</td><td>${escHtml(item.message)}</td></tr>`).join('');
+  const backupRows = (backups.files || []).map(item => `<tr><td>${escHtml(item.name)}</td><td>${(Number(item.size || 0) / 1024).toFixed(1)} KB</td><td>${escHtml(new Date(item.mtime * 1000).toLocaleString())}</td><td><a href="#" class="backup-download" data-name="${escHtml(item.name)}">下载</a></td></tr>`).join('');
   if (cur === 'usd' && (cfg.budget_currency_orig !== 'usd')) { /* 保持原值 */ }
   mask.innerHTML = `
     <div class="modal">
@@ -850,6 +862,9 @@ async function openSettings() {
       <div class="field"><label>异常倍数</label>
         <input type="number" id="cfgAnomalyMultiplier" value="${cfg.anomaly_multiplier ?? 3.0}" min="1.5" step="0.5">
       </div>
+      <div class="field" style="border-top:1px solid var(--line);padding-top:16px"><label>告警历史</label>
+        <div class="scroll-box" style="max-height:180px"><table><tr><th>时间</th><th>级别</th><th>类型</th><th>消息</th></tr>${alertRows || '<tr><td colspan="4" class="muted">暂无告警历史</td></tr>'}</table></div>
+        <div class="hint">显示最近 20 条告警记录</div></div>
       <div class="field"><label>Webhook 类型</label>
         <select id="cfgWtype">
           <option value="generic" ${cfg.webhook_type === 'generic' ? 'selected' : ''}>通用 (Generic JSON)</option>
@@ -893,6 +908,11 @@ async function openSettings() {
       <div class="field" style="border-top:1px solid var(--line);padding-top:16px"><label>只读分享</label>
         <div class="hint">${cfg.share_enabled ? '已启用：任何拿到链接的人可只读查看，无修改权限' : '未启用'}</div>
         <div style="display:flex;gap:8px;margin-top:8px"><input id="shareUrl" type="text" readonly value="${cfg.share_enabled && cfg.share_token ? location.origin + '/share/?token=' + cfg.share_token : ''}" placeholder="生成后显示分享链接" style="flex:1"><button id="shareCreate">生成链接</button><button id="shareCopy">复制</button><button id="shareRevoke">撤销</button></div></div>
+      ${state.role === 'admin' && !state.readonly ? `<div class="field" style="border-top:1px solid var(--line);padding-top:16px"><label>备份</label>
+        <div class="hint">备份目录：${escHtml(backups.backup_dir || cfg.backup_dir || '')}</div>
+        <div class="hint">每日自动备份，保留最近7份</div>
+        <button id="backupNow" style="margin:8px 0">立即备份</button>
+        <div class="scroll-box" style="max-height:180px"><table><tr><th>文件</th><th>大小</th><th>时间</th><th></th></tr>${backupRows || '<tr><td colspan="4" class="muted">暂无备份文件</td></tr>'}</table></div></div>` : ''}
       ${state.role === 'admin' && !state.readonly ? `<div class="field" style="border-top:1px solid var(--line);padding-top:16px"><label>用户管理</label>
         <div class="scroll-box" style="max-height:160px"><table><tr><th>用户名</th><th>角色</th><th></th></tr>${users.map(u => `<tr><td>${escHtml(u.username)}</td><td>${escHtml(u.role)}</td><td><button class="m-del user-del" data-username="${escHtml(u.username)}">删除</button></td></tr>`).join('') || '<tr><td colspan="3" class="muted">暂无用户</td></tr>'}</table></div>
         <div class="row" style="margin-top:12px"><div class="field"><label>用户名</label><input type="text" id="newUsername" autocomplete="off"></div><div class="field"><label>密码</label><input type="password" id="newPassword" autocomplete="new-password"></div><div class="field"><label>角色</label><select id="newRole"><option value="user">user</option><option value="admin">admin</option></select></div></div>
@@ -926,6 +946,29 @@ async function openSettings() {
       st.className = 'status err'; st.textContent = '❌ ' + e.message;
     } finally { button.disabled = false; }
   };
+  const backupNow = document.getElementById('backupNow');
+  if (backupNow) backupNow.onclick = async () => {
+    const st = document.getElementById('cfgStatus');
+    backupNow.disabled = true; st.className = 'status'; st.textContent = '正在创建备份...';
+    try {
+      const r = await api('api/backups', { method: 'POST' });
+      if (!r.ok) throw new Error(r.error || '备份失败');
+      st.className = 'status ok'; st.textContent = '✅ 已创建 ' + r.file;
+      setTimeout(() => { mask.remove(); openSettings(); }, 500);
+    } catch (e) { st.className = 'status err'; st.textContent = '❌ ' + e.message; }
+    finally { backupNow.disabled = false; }
+  };
+  mask.querySelectorAll('.backup-download').forEach(link => link.onclick = async event => {
+    event.preventDefault();
+    const name = link.dataset.name;
+    try {
+      const res = await fetch('api/backups/download?name=' + encodeURIComponent(name), { headers: { 'X-Token': localStorage.getItem(TOKEN_KEY) || '' } });
+      if (!res.ok) throw new Error('下载失败');
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob); const a = document.createElement('a');
+      a.href = url; a.download = name; a.click(); URL.revokeObjectURL(url);
+    } catch (e) { document.getElementById('cfgStatus').className = 'status err'; document.getElementById('cfgStatus').textContent = '❌ ' + e.message; }
+  });
   document.getElementById('cfgTest').onclick = async () => {
     const st = document.getElementById('cfgStatus');
     st.className = 'status'; st.textContent = '发送中...';
