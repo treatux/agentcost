@@ -493,8 +493,10 @@ def parse_range(params):
     return frm, to
 
 
-def summary(frm, to, agent=None, upstream=None, model=None):
+def summary(frm, to, agent=None, upstream=None, model=None, group_by="day"):
     """范围汇总。"""
+    if group_by not in ("day", "hour"):
+        group_by = "day"
     def agg(cond, params):
         r = query_db(f"""
             SELECT COUNT(*) as cnt,
@@ -609,7 +611,10 @@ def summary(frm, to, agent=None, upstream=None, model=None):
     prev = agg(prev_cond, prev_params)
     prev.update({"from": prev_from, "to": prev_to})
     by_agent = query_db(f"""
-        SELECT agent, COUNT(*) as cnt, SUM(total_tokens) as tokens, SUM(cost_usd) as cost
+        SELECT agent, COUNT(*) as cnt, SUM(total_tokens) as tokens, SUM(cost_usd) as cost,
+               SUM(input_tokens) as inp_tokens, SUM(output_tokens) as out_tokens,
+               SUM(cache_read_tokens) as cr_tokens, SUM(cache_write_tokens) as cw_tokens,
+               SUM(reasoning_tokens) as reasoning_tokens
         FROM usage_records WHERE {range_cond} GROUP BY agent
     """, range_params)
     by_model = query_db(f"""
@@ -620,13 +625,33 @@ def summary(frm, to, agent=None, upstream=None, model=None):
                SUM(reasoning_tokens) as reasoning_tokens
         FROM usage_records WHERE {range_cond} GROUP BY model, upstream ORDER BY tokens DESC
     """, range_params)
+    day_expr = "substr(ts,1,13)" if group_by == "hour" else "substr(ts,1,10)"
     daily = query_db(f"""
-        SELECT substr(ts,1,10) as day, COUNT(*) as cnt, SUM(total_tokens) as tokens, SUM(cost_usd) as cost,
+        SELECT {day_expr} as day, COUNT(*) as cnt, SUM(total_tokens) as tokens, SUM(cost_usd) as cost,
                SUM(input_tokens) as inp, SUM(output_tokens) as out,
                SUM(cache_read_tokens) as cr, SUM(cache_write_tokens) as cw,
                SUM(reasoning_tokens) as reasoning
         FROM usage_records WHERE {range_cond} GROUP BY day ORDER BY day
     """, range_params)
+
+    # 按日/小时、模型、上游计算缓存节省，再汇总到 daily 对应粒度。
+    daily_cache = query_db(f"""
+        SELECT {day_expr} as day, model, upstream,
+               SUM(cache_read_tokens) as cr, MIN(price_in) as pi
+        FROM usage_records WHERE {range_cond}
+        GROUP BY day, model, upstream
+    """, range_params)
+    daily_saved = {}
+    model_overrides = load_models_override()
+    for row in daily_cache:
+        cr = row.get("cr") or 0
+        pi = row.get("pi")
+        override = model_overrides.get(row.get("model")) or model_overrides.get((row.get("model") or "").split("/")[-1]) or {}
+        cache_pi = override.get("cache_price_in") if override.get("cache_price_in") is not None else (float(pi) * 0.1 if pi is not None else None)
+        saved = cr / 1e6 * (float(pi) - float(cache_pi)) if cr and pi is not None and cache_pi is not None else 0
+        daily_saved[row["day"]] = daily_saved.get(row["day"], 0) + saved
+    for row in daily:
+        row["saved_usd"] = round(daily_saved.get(row["day"], 0), 8)
 
     # 缓存节省：若无缓存，缓存读 token 按输入价计费；实际按缓存读价计费。
     for m in by_model:
@@ -643,6 +668,7 @@ def summary(frm, to, agent=None, upstream=None, model=None):
 
     return {
         "last_scan": LAST_SCAN_AT,
+        "min_ts": ((query_db("SELECT MIN(ts) AS min_ts FROM usage_records")[0].get("min_ts") or "")[:10] or None),
         "range": {"from": frm, "to": to},
         "fx": fx,
         "total": with_cny(total, ("cost", "saved_usd")),
@@ -940,9 +966,10 @@ class Handler(BaseHTTPRequestHandler):
             agent = params.get("agent", [""])[0].strip()
             upstream = params.get("upstream", [""])[0].strip()
             model = params.get("model", [""])[0].strip()
+            group_by = params.get("group_by", ["day"])[0].strip().lower()
             self.send_json({"ok": True, **summary(
                 frm, to, agent=agent or None, upstream=upstream or None,
-                model=model or None,
+                model=model or None, group_by=group_by,
             )})
         elif path == "/api/filters":
             token = self.headers.get("X-Token", "")

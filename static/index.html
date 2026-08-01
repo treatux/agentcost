@@ -575,6 +575,7 @@ function renderToolbar() {
 
 function render(el, d) {
   lastScanAt = d.last_scan || null;
+  state.min_ts = d.min_ts || state.min_ts;
   // 模型筛选项随未按模型筛选的汇总结果更新，避免选中后列表缩成单项。
   if (!state.model) state.filters.models = [...new Set(d.by_model.map(m => m.model).filter(Boolean))].sort();
   const t = d.total;
@@ -721,7 +722,7 @@ function bindToolbar() {
       const f = document.getElementById('from'); const t = document.getElementById('to');
       if (b.dataset.days) { f.value = daysAgo(+b.dataset.days); t.value = todayStr(); }
       if (b.dataset.month) { f.value = monthStart(); t.value = todayStr(); }
-      if (b.dataset.all) { f.value = '2026-01-01'; t.value = todayStr(); }
+      if (b.dataset.all) { f.value = state.min_ts || '2026-01-01'; t.value = todayStr(); }
       load();
     };
   });
